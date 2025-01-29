@@ -1,9 +1,15 @@
 package fr.tcordel.cartpole;
 
 import fr.tcordel.cartpole.CartPole.StepResult;
+import fr.tcordel.utils.Matplot;
 
+import com.github.sh0nk.matplotlib4j.PythonExecutionException;
+
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.stream.Collectors;
@@ -19,13 +25,14 @@ public class QLearning {
 	private final Random random = new Random();
 	Map<String, Map<Double, Double>> qTable = new HashMap<>();
 
-	public static void main(String[] args) {
+	public static void main(String[] args) throws IOException, PythonExecutionException {
 		QLearning qLearning = new QLearning();
 		qLearning.train();
 	}
 
-	private void train() {
+	private void train() throws IOException, PythonExecutionException {
 		CartPole cartPole = new CartPole();
+		List<Double> rewards = new ArrayList<>();
 		for (int i = 0; i < numEpisodes; i++) {
 			String state = discretese(cartPole.reset());
 			boolean done = false;
@@ -45,8 +52,11 @@ public class QLearning {
 			if (epsilon - epsilonDecay >= 0) {
 				epsilon -= epsilonDecay;
 			}
+			rewards.add((double) totalReward);
 			System.err.println("ep %d, totalReward %d".formatted(i, totalReward));
 		}
+
+		Matplot.print(rewards);
 	}
 
 	private void updateQTable(String state, double action, String newState, double reward) {
