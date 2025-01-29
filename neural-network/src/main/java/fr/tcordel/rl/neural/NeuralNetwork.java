@@ -1,0 +1,119 @@
+package fr.tcordel.rl.neural;
+
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.util.Arrays;
+import java.util.function.DoubleSupplier;
+import java.util.function.DoubleUnaryOperator;
+
+public class NeuralNetwork {
+
+	private final int[] layers;
+	private final double eta = 0.5d;
+	double[][] o;
+	double[][] deltas;
+	// layer, output, input
+	double[][][] weights;
+	double[][] thetas;
+	BigDecimal initValue = null;
+	DoubleUnaryOperator activationFonction = ActivationFonctions.RELU;
+	DoubleSupplier weightInitialisor;
+
+
+	public NeuralNetwork(int... layers) {
+		if (layers.length < 2) {
+			throw new IllegalStateException("Requires at least an input and outputs");
+		}
+		weightInitialisor = WeightInitializor.GAUSSIAN_HE.apply(layers[0]);
+		this.layers = layers;
+		weights = new double[layers.length - 1][][];
+		thetas = new double[layers.length - 1][];
+		o = new double[layers.length][];
+		deltas = new double[layers.length - 1][];
+		o[0] = new double[layers[0]];
+		int maxSize = -1;
+		for (int i = 1; i < layers.length; i++) {
+			int layerSize = layers[i];
+			int previousLayerSize = layers[i - 1];
+			maxSize = Math.max(maxSize, Math.max(layerSize, previousLayerSize));
+			thetas[i - 1] = new double[layerSize];
+			o[i] = new double[layerSize];
+			deltas[i - 1] = new double[layerSize];
+			weights[i - 1] = new double[previousLayerSize][];
+			for (int j = 0; j < previousLayerSize; j++) {
+				weights[i - 1][j] = new double[layerSize];
+			}
+		}
+
+		for (int layer = 1; layer < layers.length; layer++) {
+			int layerSize = layers[layer];
+			int previousLayerSize = layers[layer - 1];
+			for (int j = 0; j < layerSize; j++) {
+				for (int i = 0; i < previousLayerSize; i++) {
+					weights[layer - 1][i][j] = weightInitialisor.getAsDouble();
+				}
+				thetas[layer - 1][j] = weightInitialisor.getAsDouble();
+			}
+		}
+	}
+
+	private void frontward(double[] ins) {
+		System.arraycopy(ins, 0, o[0], 0, ins.length);
+		for (int i = 1; i < layers.length; i++) {
+			double[] previousLayer = o[i - 1];
+			double[] layer = o[i];
+			Arrays.fill(layer, 0, layer.length, 0);
+			for (int k = 0; k < layer.length; k++) {
+				for (int j = 0; j < previousLayer.length; j++) {
+					layer[k] += (previousLayer[j] * weights[i - 1][j][k]);
+				}
+				layer[k] += thetas[i - 1][k];
+				layer[k] = activationFonction.applyAsDouble(layer[k]);
+			}
+		}
+	}
+
+	public double[] train(double[] ins, double[] out) {
+		frontward(ins);
+
+		for (int index = o.length - 1; index > 0; index--) {
+			int layer = index - 1;
+			for (int nodeIndex = 0; nodeIndex < deltas[layer].length; nodeIndex++) {
+				deltas[layer][nodeIndex] = o[index][nodeIndex]
+						* (1 - o[index][nodeIndex]);
+				if (index == o.length - 1) {
+					deltas[layer][nodeIndex] *= (o[index][nodeIndex] - out[nodeIndex]);
+				} else {
+					double nextLayerWeight = 0;
+					for (int nextLayerNodeIndex = 0; nextLayerNodeIndex < deltas[index].length; nextLayerNodeIndex++) {
+						if (nodeIndex == 5) {
+							int a = 1;
+
+						}
+						nextLayerWeight += deltas[index][nextLayerNodeIndex]
+								* weights[index][nodeIndex][nextLayerNodeIndex];
+					}
+					deltas[layer][nodeIndex] *= nextLayerWeight;
+				}
+			}
+		}
+
+		for (int layer = 0; layer < weights.length; layer++) {
+			for (int j = 0; j < weights[layer].length; j++) {
+				for (int k = 0; k < weights[layer][j].length; k++) {
+					weights[layer][j][k] += -eta * deltas[layer][k] * o[layer][j];
+				}
+			}
+			for (int ds = 0; ds < thetas[layer].length; ds++) {
+				thetas[layer][ds] += -eta * deltas[layer][ds];
+			}
+		}
+		return o[o.length - 1];
+	}
+
+	public double[] predict(double[] ins) {
+		frontward(ins);
+		return o[o.length - 1];
+	}
+
+}
