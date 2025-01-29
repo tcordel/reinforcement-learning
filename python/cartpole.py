@@ -45,7 +45,8 @@ class CartPole():
 
         # Add a small random noise
         # (The agent won't succeed by applying zero force each time.)
-        force = 1.0 * (action + random.uniform(-0.02, 0.02))
+        f_action = (action - 0.5) *2
+        force = 1.0 * (f_action + random.uniform(-0.02, 0.02))
 
         total_mass = self._cart_mass + self._pole_mass
         pole_half_length = self._pole_length / 2

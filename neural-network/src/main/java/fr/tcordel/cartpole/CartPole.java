@@ -38,10 +38,10 @@ public class CartPole {
 		return this.state;
 	}
 
-	/**
-	 * 0 : Push cart to the left
-	 * 1 : Push cart to the right
-	 */
+	public StepResult step(int action) {
+		return step((action - 0.5) * 2);
+	}
+
 	public StepResult step(double action) {
 		if (this.done) {
 			throw new IllegalStateException("Cannot run step() before reset");

@@ -23,7 +23,7 @@ public class QLearning {
 	double epsilonDecay = epsilon / 4000;
 	int numEpisodes = 6000;
 	private final Random random = new Random();
-	Map<String, Map<Double, Double>> qTable = new HashMap<>();
+	Map<String, Map<Integer, Double>> qTable = new HashMap<>();
 
 	public static void main(String[] args) throws IOException, PythonExecutionException {
 		QLearning qLearning = new QLearning();
@@ -59,7 +59,7 @@ public class QLearning {
 		Matplot.print(rewards);
 	}
 
-	private void updateQTable(String state, double action, String newState, double reward) {
+	private void updateQTable(String state, int action, String newState, double reward) {
 		double nextMaxQ = qTable.get(newState)
 				.values()
 				.stream()
@@ -75,7 +75,12 @@ public class QLearning {
 
 	int pickSample(String state, double epsilon) {
 		if (random.nextDouble() > epsilon) {
-			return 0;
+			return qTable.get(state)
+			.entrySet()
+			.stream()
+			.max(Map.Entry.comparingByValue())
+			.map(Map.Entry::getKey)
+			.orElse(0) ;
 		} else {
 			return random.nextInt(0, 2);
 		}
@@ -99,9 +104,9 @@ public class QLearning {
 
 	private void initQTable(String state) {
 		if (!qTable.containsKey(state)) {
-			HashMap<Double, Double> hashMap = new HashMap<>();
-			hashMap.put(0d, 0d);
-			hashMap.put(1d, 0d);
+			HashMap<Integer, Double> hashMap = new HashMap<>();
+			hashMap.put(0, 0d);
+			hashMap.put(1, 0d);
 			qTable.put(state, hashMap);
 		}
 	}
