@@ -1,7 +1,6 @@
 package fr.tcordel.rl.neural;
 
 import java.math.BigDecimal;
-import java.math.MathContext;
 import java.util.Arrays;
 import java.util.function.DoubleSupplier;
 import java.util.function.DoubleUnaryOperator;
@@ -19,6 +18,43 @@ public class NeuralNetwork {
 	DoubleUnaryOperator activationFonction = ActivationFonctions.RELU;
 	DoubleSupplier weightInitialisor;
 
+	public NeuralNetwork(NeuralNetwork of) {
+		this.activationFonction = of.activationFonction;
+		this.weightInitialisor = of.weightInitialisor;
+		this.layers = new int[of.layers.length];
+		System.arraycopy(of.layers, 0, layers, 0, of.layers.length);
+		this.o = init(of.o);
+		this.deltas = init(of.deltas);
+		this.thetas = init(of.thetas);
+		this.weights = new double[of.weights.length][][];
+		for (int i = 0; i < of.weights.length; i++) {
+			this.weights[i] = new double[of.weights[i].length][];
+		}
+		load(of);
+	}
+
+	public void load(NeuralNetwork of) {
+		copy(of.o, o);
+		copy(of.deltas, deltas);
+		copy(of.thetas, thetas);
+		for (int i = 0; i < of.weights.length; i++) {
+			copy(of.weights[i], weights[i]);
+		}
+	}
+
+	private double[][] init(double[][] from) {
+		double[][] init = new double[from.length][];
+		for (int i = 0; i < from.length; i++) {
+			init[i] = new double[from[i].length];
+		}
+		return init;
+	}
+
+	private void copy(double[][] from, double[][] to) {
+		for (int i = 0; i < from.length; i++) {
+			System.arraycopy(from[i], 0, to[i], 0, from[i].length);
+		}
+	}
 
 	public NeuralNetwork(int... layers) {
 		if (layers.length < 2) {
