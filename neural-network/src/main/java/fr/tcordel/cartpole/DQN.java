@@ -1,11 +1,14 @@
 package fr.tcordel.cartpole;
 
 import fr.tcordel.cartpole.CartPole.StepResult;
+import fr.tcordel.rl.neural.ActivationFonction;
 import fr.tcordel.rl.neural.NeuralNetwork;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.stream.IntStream;
 
 public class DQN {
 	double gamma = 0.99;
@@ -14,13 +17,14 @@ public class DQN {
 	double epsilonDecay = epsilon / 3000;
 	double epsilonFinal = 0.1;
 	int numEpisodes = 15000;
-	double samplingSize = 64 * 30;
-	double batchSize = 64;
+	int batchSize = 64;
+	int optimizationIteration = 30;
+	int samplingSize = batchSize * optimizationIteration;
 
 	private final NeuralNetwork qModel;
 	private final NeuralNetwork qTargetModel;
 	private final Random random = new Random();
-	private final List<Memory> memories = new ArrayList<>(10000);
+	private final Memory memory = new Memory();
 
 	public static void main(String[] args) {
 		new DQN().train();
@@ -29,7 +33,35 @@ public class DQN {
 
 	DQN() {
 		qModel = new NeuralNetwork(4, 64, 2);
+		qModel.setActivationFonctions(ActivationFonction.RELU, ActivationFonction.NONE);
 		qTargetModel = new NeuralNetwork(qModel);
+	}
+
+	class Memory {
+		private final int size = 10000;
+		private final List<Dump> memories = new ArrayList<>(size);
+
+		void add(Dump state) {
+			if (memories.size() == size) {
+				memories.removeFirst();
+			}
+			memories.add(state);
+		}
+
+		List<Dump> sample(int batchSize) {
+			List<Integer> index = IntStream.range(0, memories.size())
+					.mapToObj(i -> i)
+					.toList();
+			List<Dump> batch = new ArrayList<>(batchSize);
+			for (int i = 0; i < batchSize; i++) {
+				batch.add(memories.get(index.get(i)));
+			}
+			return batch;
+		}
+
+		public int size() {
+			return memories.size();
+		}
 	}
 
 	int pickSample(double[] state, double epsilon) {
@@ -69,13 +101,18 @@ public class DQN {
 				done = stepResult.truncated() || stepResult.terminated();
 				// memory
 				double reward = stepResult.reward();
-				memories.add(new Memory(state, reward, action, newState));
+				memory.add(new Dump(state, reward, action, newState, stepResult.terminated() ? 1d : 0d));
 				state = newState;
 				cumReward += reward;
 			}
 
-			if (memories.size() < 2000) {
+			if (memory.size() < 2000) {
 				continue;
+			}
+
+			List<Dump> samples = memory.sample(samplingSize);
+			for (int ib = 0; ib < optimizationIteration; ib++) {
+				optimize(samples.subList(ib * optimizationIteration, (ib + 1) * optimizationIteration));
 			}
 
 			rewards.add(cumReward);
@@ -98,6 +135,27 @@ public class DQN {
 		}
 	}
 
+	private void optimize(List<Dump> subList) {
+		// compute Q(s_{t+1}) : size=[batchSize, 2]
+		List<double[]> targetVals = qTargetModel.predict(subList.stream().map(Dump::newState).toList());
+		// compute max Q(s_{t+1}) : size=[batchSize]
+		double[] maxTarget = targetVals.stream().mapToDouble(values -> Arrays.stream(values).max().orElseThrow())
+				.toArray();
+		// compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batchSize]
+		double[] qVals1 = IntStream.range(0, subList.size())
+				.mapToDouble(i -> {
+					Dump dump = subList.get(i);
+					return dump.reward() + gamma * (1 - dump.done()) * maxTarget[i];
+				}).toArray();
+
+		double[] qVals2 = IntStream.range(0, subList.size())
+				.mapToDouble(i -> {
+					Dump dump = subList.get(i);
+					return qModel.predict(dump.state())[dump.action()];
+				}).toArray();
+
+	}
+
 	private double evaluate(CartPole cartPole) {
 
 		double cumReward = 0;
@@ -113,6 +171,6 @@ public class DQN {
 		return cumReward;
 	}
 
-	record Memory(double[] state, double reward, int action, double[] newState) {
+	record Dump(double[] state, double reward, int action, double[] newState, double done) {
 	}
 }

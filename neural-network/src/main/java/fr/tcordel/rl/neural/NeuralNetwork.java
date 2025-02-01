@@ -2,8 +2,8 @@ package fr.tcordel.rl.neural;
 
 import java.math.BigDecimal;
 import java.util.Arrays;
+import java.util.List;
 import java.util.function.DoubleSupplier;
-import java.util.function.DoubleUnaryOperator;
 
 public class NeuralNetwork {
 
@@ -15,11 +15,11 @@ public class NeuralNetwork {
 	double[][][] weights;
 	double[][] thetas;
 	BigDecimal initValue = null;
-	DoubleUnaryOperator activationFonction = ActivationFonctions.RELU;
+	ActivationFonction[] activationFonctions;
 	DoubleSupplier weightInitialisor;
 
 	public NeuralNetwork(NeuralNetwork of) {
-		this.activationFonction = of.activationFonction;
+		this.activationFonctions = Arrays.copyOf(of.activationFonctions, of.activationFonctions.length);
 		this.weightInitialisor = of.weightInitialisor;
 		this.layers = new int[of.layers.length];
 		System.arraycopy(of.layers, 0, layers, 0, of.layers.length);
@@ -104,7 +104,7 @@ public class NeuralNetwork {
 					layer[k] += (previousLayer[j] * weights[i - 1][j][k]);
 				}
 				layer[k] += thetas[i - 1][k];
-				layer[k] = activationFonction.applyAsDouble(layer[k]);
+				layer[k] = activationFonctions[i-1].forward(layer[k]);
 			}
 		}
 	}
@@ -116,16 +116,12 @@ public class NeuralNetwork {
 			int layer = index - 1;
 			for (int nodeIndex = 0; nodeIndex < deltas[layer].length; nodeIndex++) {
 				deltas[layer][nodeIndex] = o[index][nodeIndex]
-						* (1 - o[index][nodeIndex]);
+						* activationFonctions[index].backward(o[index][nodeIndex]);
 				if (index == o.length - 1) {
 					deltas[layer][nodeIndex] *= (o[index][nodeIndex] - out[nodeIndex]);
 				} else {
 					double nextLayerWeight = 0;
 					for (int nextLayerNodeIndex = 0; nextLayerNodeIndex < deltas[index].length; nextLayerNodeIndex++) {
-						if (nodeIndex == 5) {
-							int a = 1;
-
-						}
 						nextLayerWeight += deltas[index][nextLayerNodeIndex]
 								* weights[index][nodeIndex][nextLayerNodeIndex];
 					}
@@ -152,4 +148,17 @@ public class NeuralNetwork {
 		return o[o.length - 1];
 	}
 
+	public List<double[]> predict(List<double[]> ins) {
+		return ins
+		.stream()
+		.map(this::predict)
+		.toList();
+	}
+
+	record Layer(int size, ActivationFonction activationFonction) {};
+	record Network(int in, List<Layer> hidden, Layer out) {}
+
+	public void setActivationFonctions(ActivationFonction... activationFonctions) {
+		this.activationFonctions = activationFonctions;
+	}
 }

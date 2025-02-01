@@ -12,8 +12,8 @@ from cartpole import CartPole
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 gamma = 0.99
-sampling_size = 64 * 30
-batch_size = 64
+batch_size = 3
+sampling_size = 3 *2 
 
 epsilon = 1.0
 epsilon_decay = epsilon / 3000
@@ -106,6 +106,9 @@ def optimize(states, actions, rewards, next_states, dones):
     #
     # Get MSE loss and optimize
     #
+    mse = ((q_vals1[0] - q_vals2[0])*(q_vals1[0] - q_vals2[0])+
+    (q_vals1[1] - q_vals2[1])*(q_vals1[1] - q_vals2[1])+
+    (q_vals1[2] - q_vals2[2])*(q_vals1[2] - q_vals2[2]))/3
     loss = F.mse_loss(q_vals1.detach(), q_vals2, reduction="mean")
     loss.backward()
     opt.step()
