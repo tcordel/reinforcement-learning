@@ -19,7 +19,7 @@ public class NNAgent implements Agent {
 	public NNAgent(TicTacToe game, char player) {
 		this.game = game;
 		this.player = player;
-		this.neuralNetwork = new NeuralNetwork(18, 200, 200, 9);
+		this.neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, 18, 200, 200, 9);
 		ins = new double[18];
 	}
 
@@ -44,7 +44,7 @@ public class NNAgent implements Agent {
 				maxPredict = predict[i];
 			}
 		}
-		
+
 		int x = maxIndex / 3;
 		int y = maxIndex % 3;
 		game.play(player, x, y);
@@ -53,7 +53,6 @@ public class NNAgent implements Agent {
 
 	@Override
 	public void updateStrategy(double reward) {
-
 
 	}
 

@@ -6,6 +6,7 @@ import java.util.function.IntFunction;
 
 public interface WeightInitializor {
 
+	DoubleSupplier ZERO = () -> 0d;
 	DoubleSupplier RANDOM_POSITIVE = new DoubleSupplier() {
 		Random random = new Random();
 

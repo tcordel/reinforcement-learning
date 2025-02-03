@@ -3,9 +3,6 @@ package fr.tcordel.cartpole;
 import fr.tcordel.cartpole.CartPole.StepResult;
 import fr.tcordel.utils.Matplot;
 
-import com.github.sh0nk.matplotlib4j.PythonExecutionException;
-
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -25,12 +22,12 @@ public class QLearning {
 	private final Random random = new Random();
 	Map<String, Map<Integer, Double>> qTable = new HashMap<>();
 
-	public static void main(String[] args) throws IOException, PythonExecutionException {
+	public static void main(String[] args){
 		QLearning qLearning = new QLearning();
 		qLearning.train();
 	}
 
-	private void train() throws IOException, PythonExecutionException {
+	private void train() {
 		CartPole cartPole = new CartPole();
 		List<Double> rewards = new ArrayList<>();
 		for (int i = 0; i < numEpisodes; i++) {

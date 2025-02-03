@@ -13,7 +13,7 @@ public abstract class Matplot {
 	private Matplot() {
 	}
 
-	public static void print(List<Double> values) throws IOException, PythonExecutionException {
+	public static void print(List<Double> values)  {
 
 		List<Double> meanValues = new ArrayList<>();
 
@@ -33,7 +33,11 @@ public abstract class Matplot {
 				IntStream.range(0, values.size()).mapToObj(i -> i).toList(),
 				meanValues).linestyle("-")
 				.color("orange");
-		plot.show();
+		try {
+			plot.show();
+		} catch (IOException | PythonExecutionException e) {
+			e.printStackTrace();
+		}
 	}
 
 }

@@ -3,6 +3,9 @@ package fr.tcordel.cartpole;
 import fr.tcordel.cartpole.CartPole.StepResult;
 import fr.tcordel.rl.neural.ActivationFonction;
 import fr.tcordel.rl.neural.NeuralNetwork;
+import fr.tcordel.rl.neural.NeuralUtils;
+import fr.tcordel.rl.neural.WeightInitializor;
+import fr.tcordel.utils.Matplot;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -32,7 +35,7 @@ public class DQN {
 	}
 
 	DQN() {
-		qModel = new NeuralNetwork(4, 64, 2);
+		qModel = new NeuralNetwork(WeightInitializor.ZERO, 4, 64, 2);
 		qModel.setActivationFonctions(ActivationFonction.RELU, ActivationFonction.NONE);
 		qTargetModel = new NeuralNetwork(qModel);
 	}
@@ -43,7 +46,7 @@ public class DQN {
 
 		void add(Dump state) {
 			if (memories.size() == size) {
-				memories.removeFirst();
+				memories.remove(0);
 			}
 			memories.add(state);
 		}
@@ -61,6 +64,10 @@ public class DQN {
 
 		public int size() {
 			return memories.size();
+		}
+
+		public void clear() {
+			memories.clear();
 		}
 	}
 
@@ -133,26 +140,42 @@ public class DQN {
 				break;
 			}
 		}
+
+		Matplot.print(rewards);
 	}
 
 	private void optimize(List<Dump> subList) {
 		// compute Q(s_{t+1}) : size=[batchSize, 2]
 		List<double[]> targetVals = qTargetModel.predict(subList.stream().map(Dump::newState).toList());
 		// compute max Q(s_{t+1}) : size=[batchSize]
+		List<int[]> oneHots = subList.stream()
+				.map(dump -> IntStream.range(0, 2).map(i -> i == dump.action() ? 1 : 0).toArray())
+				.toList();
 		double[] maxTarget = targetVals.stream().mapToDouble(values -> Arrays.stream(values).max().orElseThrow())
 				.toArray();
 		// compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batchSize]
-		double[] qVals1 = IntStream.range(0, subList.size())
-				.mapToDouble(i -> {
+		List<double[]> qVals1 = IntStream.range(0, subList.size())
+				.mapToObj(i -> {
 					Dump dump = subList.get(i);
-					return dump.reward() + gamma * (1 - dump.done()) * maxTarget[i];
-				}).toArray();
+					double newQ = dump.reward() + gamma * (1 - dump.done()) * maxTarget[i];
+					return IntStream.range(0, 2).mapToDouble(index -> index == dump.action() ? newQ : 0d).toArray();
+				}).toList();
 
-		double[] qVals2 = IntStream.range(0, subList.size())
-				.mapToDouble(i -> {
-					Dump dump = subList.get(i);
-					return qModel.predict(dump.state())[dump.action()];
-				}).toArray();
+		for (int i = 0; i < subList.size(); i++) {
+			double mse = 1;
+			while (mse > 0.1) {
+				double[] out = qVals1.get(i);
+				int[] oneHot = oneHots.get(i);
+				double[] train = qModel.train(subList.get(i).state(), out, oneHot);
+				mse = NeuralUtils.mse(train, out, oneHot);
+				System.err.println(mse);
+			}
+		}
+		// double[] qVals2 = IntStream.range(0, subList.size())
+		// .mapToDouble(i -> {
+		// Dump dump = subList.get(i);
+		// return qModel.predict(dump.state())[dump.action()];
+		// }).toArray();
 
 	}
 

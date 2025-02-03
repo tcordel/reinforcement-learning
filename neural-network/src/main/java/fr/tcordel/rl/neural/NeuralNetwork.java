@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.DoubleSupplier;
+import java.util.stream.IntStream;
 
 public class NeuralNetwork {
 
@@ -16,11 +17,9 @@ public class NeuralNetwork {
 	double[][] thetas;
 	BigDecimal initValue = null;
 	ActivationFonction[] activationFonctions;
-	DoubleSupplier weightInitialisor;
 
 	public NeuralNetwork(NeuralNetwork of) {
 		this.activationFonctions = Arrays.copyOf(of.activationFonctions, of.activationFonctions.length);
-		this.weightInitialisor = of.weightInitialisor;
 		this.layers = new int[of.layers.length];
 		System.arraycopy(of.layers, 0, layers, 0, of.layers.length);
 		this.o = init(of.o);
@@ -28,7 +27,7 @@ public class NeuralNetwork {
 		this.thetas = init(of.thetas);
 		this.weights = new double[of.weights.length][][];
 		for (int i = 0; i < of.weights.length; i++) {
-			this.weights[i] = new double[of.weights[i].length][];
+			this.weights[i] = init(of.weights[i]);
 		}
 		load(of);
 	}
@@ -56,11 +55,10 @@ public class NeuralNetwork {
 		}
 	}
 
-	public NeuralNetwork(int... layers) {
+	public NeuralNetwork(DoubleSupplier weightInitialisor, int... layers) {
 		if (layers.length < 2) {
 			throw new IllegalStateException("Requires at least an input and outputs");
 		}
-		weightInitialisor = WeightInitializor.GAUSSIAN_HE.apply(layers[0]);
 		this.layers = layers;
 		weights = new double[layers.length - 1][][];
 		thetas = new double[layers.length - 1][];
@@ -104,21 +102,29 @@ public class NeuralNetwork {
 					layer[k] += (previousLayer[j] * weights[i - 1][j][k]);
 				}
 				layer[k] += thetas[i - 1][k];
-				layer[k] = activationFonctions[i-1].forward(layer[k]);
+				layer[k] = activationFonctions[i - 1].forward(layer[k]);
 			}
 		}
 	}
 
 	public double[] train(double[] ins, double[] out) {
+		return train(ins, out, IntStream.range(0, out.length).map(i -> 1).toArray());
+	}
+
+	public double[] train(double[] ins, double[] out, int[] oneHot) {
 		frontward(ins);
+
+		for (int i = 0; i < deltas.length; i++) {
+			Arrays.fill(deltas[i], 0, deltas[i].length, 0d);
+		}
 
 		for (int index = o.length - 1; index > 0; index--) {
 			int layer = index - 1;
 			for (int nodeIndex = 0; nodeIndex < deltas[layer].length; nodeIndex++) {
 				deltas[layer][nodeIndex] = o[index][nodeIndex]
-						* activationFonctions[index].backward(o[index][nodeIndex]);
+						* activationFonctions[index - 1].backward(o[index][nodeIndex]);
 				if (index == o.length - 1) {
-					deltas[layer][nodeIndex] *= (o[index][nodeIndex] - out[nodeIndex]);
+					deltas[layer][nodeIndex] *= (o[index][nodeIndex] - out[nodeIndex]) * oneHot[nodeIndex];
 				} else {
 					double nextLayerWeight = 0;
 					for (int nextLayerNodeIndex = 0; nextLayerNodeIndex < deltas[index].length; nextLayerNodeIndex++) {
@@ -150,13 +156,16 @@ public class NeuralNetwork {
 
 	public List<double[]> predict(List<double[]> ins) {
 		return ins
-		.stream()
-		.map(this::predict)
-		.toList();
+				.stream()
+				.map(this::predict)
+				.toList();
 	}
 
-	record Layer(int size, ActivationFonction activationFonction) {};
-	record Network(int in, List<Layer> hidden, Layer out) {}
+	record Layer(int size, ActivationFonction activationFonction) {
+	};
+
+	record Network(int in, List<Layer> hidden, Layer out) {
+	}
 
 	public void setActivationFonctions(ActivationFonction... activationFonctions) {
 		this.activationFonctions = activationFonctions;
