@@ -10,11 +10,12 @@ public class NeuralNetwork {
 
 	private final int[] layers;
 	private final double eta = 0.5d;
-	double[][] o;
+	public double[][] o;
 	double[][] deltas;
 	// layer, output, input
-	double[][][] weights;
-	double[][] thetas;
+	public double[][][] weights;
+	public double[][] thetas;
+	boolean biais = true;
 	BigDecimal initValue = null;
 	ActivationFonction[] activationFonctions;
 
@@ -23,8 +24,11 @@ public class NeuralNetwork {
 		this.layers = new int[of.layers.length];
 		System.arraycopy(of.layers, 0, layers, 0, of.layers.length);
 		this.o = init(of.o);
+		this.biais = of.biais;
 		this.deltas = init(of.deltas);
-		this.thetas = init(of.thetas);
+		if (biais) {
+			this.thetas = init(of.thetas);
+		}
 		this.weights = new double[of.weights.length][][];
 		for (int i = 0; i < of.weights.length; i++) {
 			this.weights[i] = init(of.weights[i]);
@@ -35,13 +39,15 @@ public class NeuralNetwork {
 	public void load(NeuralNetwork of) {
 		copy(of.o, o);
 		copy(of.deltas, deltas);
-		copy(of.thetas, thetas);
+		if (biais) {
+			copy(of.thetas, thetas);
+		}
 		for (int i = 0; i < of.weights.length; i++) {
 			copy(of.weights[i], weights[i]);
 		}
 	}
 
-	private double[][] init(double[][] from) {
+	public static double[][] init(double[][] from) {
 		double[][] init = new double[from.length][];
 		for (int i = 0; i < from.length; i++) {
 			init[i] = new double[from[i].length];
@@ -55,13 +61,16 @@ public class NeuralNetwork {
 		}
 	}
 
-	public NeuralNetwork(DoubleSupplier weightInitialisor, int... layers) {
+	public NeuralNetwork(DoubleSupplier weightInitialisor, boolean biais, int... layers) {
 		if (layers.length < 2) {
 			throw new IllegalStateException("Requires at least an input and outputs");
 		}
 		this.layers = layers;
+		this.biais = biais;
 		weights = new double[layers.length - 1][][];
-		thetas = new double[layers.length - 1][];
+		if (biais) {
+			thetas = new double[layers.length - 1][];
+		}
 		o = new double[layers.length][];
 		deltas = new double[layers.length - 1][];
 		o[0] = new double[layers[0]];
@@ -70,7 +79,9 @@ public class NeuralNetwork {
 			int layerSize = layers[i];
 			int previousLayerSize = layers[i - 1];
 			maxSize = Math.max(maxSize, Math.max(layerSize, previousLayerSize));
-			thetas[i - 1] = new double[layerSize];
+			if (biais) {
+				thetas[i - 1] = new double[layerSize];
+			}
 			o[i] = new double[layerSize];
 			deltas[i - 1] = new double[layerSize];
 			weights[i - 1] = new double[previousLayerSize][];
@@ -86,7 +97,10 @@ public class NeuralNetwork {
 				for (int i = 0; i < previousLayerSize; i++) {
 					weights[layer - 1][i][j] = weightInitialisor.getAsDouble();
 				}
-				thetas[layer - 1][j] = weightInitialisor.getAsDouble();
+
+				if (biais) {
+					thetas[layer - 1][j] = weightInitialisor.getAsDouble();
+				}
 			}
 		}
 	}
@@ -101,17 +115,19 @@ public class NeuralNetwork {
 				for (int j = 0; j < previousLayer.length; j++) {
 					layer[k] += (previousLayer[j] * weights[i - 1][j][k]);
 				}
-				layer[k] += thetas[i - 1][k];
+				if (biais) {
+					layer[k] += thetas[i - 1][k];
+				}
 				layer[k] = activationFonctions[i - 1].forward(layer[k]);
 			}
 		}
 	}
 
 	public double[] train(double[] ins, double[] out) {
-		return train(ins, out, IntStream.range(0, out.length).map(i -> 1).toArray());
+		return train(ins, out, IntStream.range(0, out.length).map(i -> 1).toArray(), 1);
 	}
 
-	public double[] train(double[] ins, double[] out, int[] oneHot) {
+	public double[] train(double[] ins, double[] out, int[] oneHot, int size) {
 		frontward(ins);
 
 		for (int i = 0; i < deltas.length; i++) {
@@ -142,7 +158,7 @@ public class NeuralNetwork {
 					weights[layer][j][k] += -eta * deltas[layer][k] * o[layer][j];
 				}
 			}
-			for (int ds = 0; ds < thetas[layer].length; ds++) {
+			for (int ds = 0; biais && ds < thetas[layer].length; ds++) {
 				thetas[layer][ds] += -eta * deltas[layer][ds];
 			}
 		}
@@ -151,7 +167,7 @@ public class NeuralNetwork {
 
 	public double[] predict(double[] ins) {
 		frontward(ins);
-		return o[o.length - 1];
+		return Arrays.copyOf(o[o.length - 1], o[o.length -1].length);
 	}
 
 	public List<double[]> predict(List<double[]> ins) {

@@ -39,7 +39,7 @@ public enum ActivationFonction {
 		}
 	};
 
-	abstract double forward(double value);
+	public abstract double forward(double value);
 
-	abstract double backward(double value);
+	public abstract double backward(double value);
 }

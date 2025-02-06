@@ -15,6 +15,14 @@ public interface WeightInitializor {
 			return random.nextDouble();
 		}
 	};
+	DoubleSupplier RANDOM = new DoubleSupplier() {
+		Random random = new Random();
+
+		@Override
+		public double getAsDouble() {
+			return random.nextDouble() * 2 - 1;
+		}
+	};
 
 	// for sigmoid and tanh
 	IntFunction<DoubleSupplier> XAVIER = inputNodeLength -> new DoubleSupplier() {

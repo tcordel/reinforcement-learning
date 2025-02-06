@@ -3,12 +3,12 @@ package fr.tcordel.cartpole;
 import fr.tcordel.cartpole.CartPole.StepResult;
 import fr.tcordel.rl.neural.ActivationFonction;
 import fr.tcordel.rl.neural.NeuralNetwork;
-import fr.tcordel.rl.neural.NeuralUtils;
 import fr.tcordel.rl.neural.WeightInitializor;
 import fr.tcordel.utils.Matplot;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.stream.IntStream;
@@ -35,7 +35,7 @@ public class DQN {
 	}
 
 	DQN() {
-		qModel = new NeuralNetwork(WeightInitializor.ZERO, 4, 64, 2);
+		qModel = new NeuralNetwork(WeightInitializor.RANDOM, true, 4, 64, 2);
 		qModel.setActivationFonctions(ActivationFonction.RELU, ActivationFonction.NONE);
 		qTargetModel = new NeuralNetwork(qModel);
 	}
@@ -52,9 +52,10 @@ public class DQN {
 		}
 
 		List<Dump> sample(int batchSize) {
-			List<Integer> index = IntStream.range(0, memories.size())
-					.mapToObj(i -> i)
-					.toList();
+			List<Integer> index = new ArrayList<>();
+			IntStream.range(0, memories.size())
+					.forEach(index::add);
+			Collections.shuffle(index);
 			List<Dump> batch = new ArrayList<>(batchSize);
 			for (int i = 0; i < batchSize; i++) {
 				batch.add(memories.get(index.get(i)));
@@ -117,10 +118,14 @@ public class DQN {
 				continue;
 			}
 
-			List<Dump> samples = memory.sample(samplingSize);
-			for (int ib = 0; ib < optimizationIteration; ib++) {
-				optimize(samples.subList(ib * optimizationIteration, (ib + 1) * optimizationIteration));
-			}
+			List<Dump> samples = memory.sample(batchSize);
+			// for (int j = 0; j < optimizationIteration; j++) {
+				optimize(samples);
+			// }
+			// for (int ib = 0; ib < optimizationIteration; ib++) {
+			// optimize(samples.subList(ib * optimizationIteration, (ib + 1) *
+			// optimizationIteration));
+			// }
 
 			rewards.add(cumReward);
 			System.out.println(
@@ -145,37 +150,109 @@ public class DQN {
 	}
 
 	private void optimize(List<Dump> subList) {
-		// compute Q(s_{t+1}) : size=[batchSize, 2]
-		List<double[]> targetVals = qTargetModel.predict(subList.stream().map(Dump::newState).toList());
-		// compute max Q(s_{t+1}) : size=[batchSize]
-		List<int[]> oneHots = subList.stream()
-				.map(dump -> IntStream.range(0, 2).map(i -> i == dump.action() ? 1 : 0).toArray())
-				.toList();
-		double[] maxTarget = targetVals.stream().mapToDouble(values -> Arrays.stream(values).max().orElseThrow())
-				.toArray();
-		// compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batchSize]
-		List<double[]> qVals1 = IntStream.range(0, subList.size())
-				.mapToObj(i -> {
-					Dump dump = subList.get(i);
-					double newQ = dump.reward() + gamma * (1 - dump.done()) * maxTarget[i];
-					return IntStream.range(0, 2).mapToDouble(index -> index == dump.action() ? newQ : 0d).toArray();
-				}).toList();
+		for (Dump dump : subList) {
 
-		for (int i = 0; i < subList.size(); i++) {
-			double mse = 1;
-			while (mse > 0.1) {
-				double[] out = qVals1.get(i);
-				int[] oneHot = oneHots.get(i);
-				double[] train = qModel.train(subList.get(i).state(), out, oneHot);
-				mse = NeuralUtils.mse(train, out, oneHot);
-				System.err.println(mse);
-			}
+			double delta1 = optimize(dump);
+			String a = "";
 		}
+
+		// // compute Q(s_{t+1}) : size=[batchSize, 2]
+		// List<double[]> targetVals =
+		// qTargetModel.predict(subList.stream().map(Dump::newState).toList());
+		// // compute max Q(s_{t+1}) : size=[batchSize]
+		// List<int[]> oneHots = subList.stream()
+		// .map(dump -> IntStream.range(0, 2).map(i -> i == dump.action() ? 1 :
+		// 0).toArray())
+		// .toList();
+		// double[] maxTarget = targetVals.stream().mapToDouble(values ->
+		// Arrays.stream(values).max().orElseThrow())
+		// .toArray();
+		// // compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batchSize]
+		// List<double[]> qVals1 = IntStream.range(0, subList.size())
+		// .mapToObj(i -> {
+		// Dump dump = subList.get(i);
+		// double newQ = dump.reward() + gamma * (1 - dump.done()) * maxTarget[i];
+		// return IntStream.range(0, 2).mapToDouble(index -> index == dump.action() ?
+		// newQ : 0d).toArray();
+		// }).toList();
+		//
+		// for (int i = 0; i < subList.size(); i++) {
+		// double mse = 1;
+		// while (mse > 0.1) {
+		// double[] out = qVals1.get(i);
+		// int[] oneHot = oneHots.get(i);
+		// double mse1 = NeuralUtils.mse(qModel.predict(subList.get(i).state()), out,
+		// oneHot);
+		// double[] train = qModel.train(subList.get(i).state(), out, oneHot,
+		// subList.size());
+		// mse = NeuralUtils.mse(train, out, oneHot);
+		// double x = mse1 - mse;
+		// System.err.println(x);
+		// }
+		// }
 		// double[] qVals2 = IntStream.range(0, subList.size())
 		// .mapToDouble(i -> {
 		// Dump dump = subList.get(i);
 		// return qModel.predict(dump.state())[dump.action()];
 		// }).toArray();
+
+	}
+
+	private double optimize(Dump dump) {
+		double[] qValues = qModel.predict(dump.state());
+		double qValueSelected = qValues[dump.action()];
+
+		double target = dump.reward()
+				+ gamma * (1 - dump.done()) * Arrays.stream(qTargetModel.predict(dump.newState())).max().orElse(0d);
+
+		double delta = target - qValueSelected;
+
+		double[] hidden = qModel.o[1];
+		double[] gradHidden = new double[hidden.length];
+
+		double[][] w1 = qModel.weights[0];
+		double[][] w2 = qModel.weights[1];
+
+		double[][] gradW1 = NeuralNetwork.init(w1);
+		double[][] gradW2 = NeuralNetwork.init(w2);
+
+		for (int i = 0; i < gradW2.length; i++) {
+			gradW2[i][dump.action()] = delta * hidden[i];
+		}
+
+		for (int i = 0; i < gradHidden.length; i++) {
+			gradHidden[i] = delta * w2[i][dump.action()] * ActivationFonction.RELU.backward(hidden[i]);
+		}
+
+		for (int i = 0; i < gradW1.length; i++) {
+			for (int j = 0; j < gradW1[i].length; j++) {
+				gradW1[i][j] = dump.state()[i] * gradHidden[j];
+			}
+		}
+
+		for (int i = 0; i < gradW2.length; i++) {
+			for (int j = 0; j < gradW2[i].length; j++) {
+				w2[i][j] += alpha * gradW2[i][j];
+			}
+		}
+
+		for (int i = 0; i < gradW1.length; i++) {
+			for (int j = 0; j < gradW1[i].length; j++) {
+				w1[i][j] += alpha * gradW1[i][j];
+			}
+		}
+		for (int i = 0; i < gradHidden.length; i++) {
+			qModel.thetas[0][i] += alpha * gradHidden[i];
+		}
+		for (int i = 0; i < qModel.thetas[1].length; i++) {
+			qModel.thetas[1][i] += alpha * delta;
+			
+		}
+
+		double[] qValues2 = qModel.predict(dump.state());
+
+		double delta2 = target - qValues2[dump.action()];
+		return delta;
 
 	}
 
