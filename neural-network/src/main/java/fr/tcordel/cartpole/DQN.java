@@ -118,14 +118,13 @@ public class DQN {
 				continue;
 			}
 
-			List<Dump> samples = memory.sample(batchSize);
+			List<Dump> samples = memory.sample(samplingSize);
 			// for (int j = 0; j < optimizationIteration; j++) {
-				optimize(samples);
+			// optimize(samples);
 			// }
-			// for (int ib = 0; ib < optimizationIteration; ib++) {
-			// optimize(samples.subList(ib * optimizationIteration, (ib + 1) *
-			// optimizationIteration));
-			// }
+			for (int ib = 0; ib < optimizationIteration; ib++) {
+				optimize(samples.subList(ib * optimizationIteration, (ib + 1) * optimizationIteration));
+			}
 
 			rewards.add(cumReward);
 			System.out.println(
@@ -150,10 +149,59 @@ public class DQN {
 	}
 
 	private void optimize(List<Dump> subList) {
+		double[][] w1 = qModel.weights[0];
+		double[][] w2 = qModel.weights[1];
+		double[][] gradW1 = NeuralNetwork.init(w1);
+		double[][] gradW2 = NeuralNetwork.init(w2);
+		double[] hidden = qModel.o[1];
+		double[] gradHidden = new double[hidden.length];
+		double deltaTotal = 0;
 		for (Dump dump : subList) {
 
-			double delta1 = optimize(dump);
-			String a = "";
+			double[] qValues = qModel.predict(dump.state());
+			double qValueSelected = qValues[dump.action()];
+
+			double target = dump.reward()
+					+ gamma * (1 - dump.done()) * Arrays.stream(qTargetModel.predict(dump.newState())).max().orElse(0d);
+
+			double delta = target - qValueSelected;
+			deltaTotal += delta;
+
+			double[] hidden1 = qModel.o[1];
+			double[] gradHidden1 = new double[hidden1.length];
+
+			for (int i3 = 0; i3 < gradW2.length; i3++) {
+				gradW2[i3][dump.action()] += delta * hidden1[i3];
+			}
+
+			for (int i1 = 0; i1 < gradHidden1.length; i1++) {
+				gradHidden1[i1] = delta * w2[i1][dump.action()] * ActivationFonction.RELU.backward(hidden1[i1]);
+			}
+
+			for (int i2 = 0; i2 < gradW1.length; i2++) {
+				for (int j1 = 0; j1 < gradW1[i2].length; j1++) {
+					gradW1[i2][j1] += dump.state()[i2] * gradHidden1[j1];
+				}
+			}
+
+		}
+
+		for (int i = 0; i < gradW2.length; i++) {
+			for (int j = 0; j < gradW2[i].length; j++) {
+				w2[i][j] += alpha * gradW2[i][j] / subList.size();
+			}
+		}
+
+		for (int i = 0; i < gradW1.length; i++) {
+			for (int j = 0; j < gradW1[i].length; j++) {
+				w1[i][j] += alpha * gradW1[i][j] / subList.size();
+			}
+		}
+		for (int i = 0; i < gradHidden.length; i++) {
+			qModel.thetas[0][i] += alpha * gradHidden[i] / subList.size();
+		}
+		for (int i = 0; i < qModel.thetas[1].length; i++) {
+			qModel.thetas[1][i] += alpha * deltaTotal / subList.size();
 		}
 
 		// // compute Q(s_{t+1}) : size=[batchSize, 2]
@@ -195,64 +243,6 @@ public class DQN {
 		// Dump dump = subList.get(i);
 		// return qModel.predict(dump.state())[dump.action()];
 		// }).toArray();
-
-	}
-
-	private double optimize(Dump dump) {
-		double[] qValues = qModel.predict(dump.state());
-		double qValueSelected = qValues[dump.action()];
-
-		double target = dump.reward()
-				+ gamma * (1 - dump.done()) * Arrays.stream(qTargetModel.predict(dump.newState())).max().orElse(0d);
-
-		double delta = target - qValueSelected;
-
-		double[] hidden = qModel.o[1];
-		double[] gradHidden = new double[hidden.length];
-
-		double[][] w1 = qModel.weights[0];
-		double[][] w2 = qModel.weights[1];
-
-		double[][] gradW1 = NeuralNetwork.init(w1);
-		double[][] gradW2 = NeuralNetwork.init(w2);
-
-		for (int i = 0; i < gradW2.length; i++) {
-			gradW2[i][dump.action()] = delta * hidden[i];
-		}
-
-		for (int i = 0; i < gradHidden.length; i++) {
-			gradHidden[i] = delta * w2[i][dump.action()] * ActivationFonction.RELU.backward(hidden[i]);
-		}
-
-		for (int i = 0; i < gradW1.length; i++) {
-			for (int j = 0; j < gradW1[i].length; j++) {
-				gradW1[i][j] = dump.state()[i] * gradHidden[j];
-			}
-		}
-
-		for (int i = 0; i < gradW2.length; i++) {
-			for (int j = 0; j < gradW2[i].length; j++) {
-				w2[i][j] += alpha * gradW2[i][j];
-			}
-		}
-
-		for (int i = 0; i < gradW1.length; i++) {
-			for (int j = 0; j < gradW1[i].length; j++) {
-				w1[i][j] += alpha * gradW1[i][j];
-			}
-		}
-		for (int i = 0; i < gradHidden.length; i++) {
-			qModel.thetas[0][i] += alpha * gradHidden[i];
-		}
-		for (int i = 0; i < qModel.thetas[1].length; i++) {
-			qModel.thetas[1][i] += alpha * delta;
-			
-		}
-
-		double[] qValues2 = qModel.predict(dump.state());
-
-		double delta2 = target - qValues2[dump.action()];
-		return delta;
 
 	}
 
