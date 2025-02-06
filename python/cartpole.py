@@ -19,6 +19,9 @@ class CartPole():
         self._state = []
         self._done = True
 
+    def close(self):
+        return True
+
     def reset(self):
         self._step = 0
         self._cart_position = math.tanh(random.gauss(0.0, 0.01)) * 4.8  # (m)
