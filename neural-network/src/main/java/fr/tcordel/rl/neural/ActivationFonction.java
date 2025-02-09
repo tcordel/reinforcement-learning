@@ -16,7 +16,7 @@ public enum ActivationFonction {
 		}
 
 		public double backward(double value) {
-			return 1d - value;
+			return value * (1d - value);
 		}
 	},
 	TANH {

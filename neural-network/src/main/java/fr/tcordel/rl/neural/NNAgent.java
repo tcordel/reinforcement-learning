@@ -19,7 +19,7 @@ public class NNAgent implements Agent {
 	public NNAgent(TicTacToe game, char player) {
 		this.game = game;
 		this.player = player;
-		this.neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, true, 18, 200, 200, 9);
+		this.neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, 18, 200, 200, 9);
 		ins = new double[18];
 	}
 

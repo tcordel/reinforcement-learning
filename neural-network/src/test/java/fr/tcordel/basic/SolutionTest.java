@@ -30,7 +30,7 @@ class SolutionTest {
 		List<double[]> ousTest = List.of(
 				new double[] { 0 },
 				new double[] { 1 });
-		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, true, inputs, outputs);
+		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, inputs, outputs);
 		for (int j = 0; j < trainingIterations; j++) {
 			for (int i = 0; i < trainingExamples; i++) {
 				neuralNetwork.train(insTest.get(i), ousTest.get(i));
@@ -62,7 +62,7 @@ class SolutionTest {
 				new double[] { 1 },
 				new double[] { 1 },
 				new double[] { 1 });
-		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, true, inputs, outputs);
+		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, inputs, outputs);
 		for (int j = 0; j < trainingIterations; j++) {
 			for (int i = 0; i < trainingExamples; i++) {
 				neuralNetwork.train(insTest.get(i), ousTest.get(i));
@@ -74,7 +74,7 @@ class SolutionTest {
 
 	@Test
 	void testXor() {
-		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, true, 2, 2, 1);
+		NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, 2, 2, 1);
 
 		int trainingExamples = 4;
 		int trainingIterations = 2400;
@@ -109,7 +109,7 @@ class SolutionTest {
 
 	@Test
 	void testHidden() {
-	NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, true, 4, 2, 2, 1);
+	NeuralNetwork neuralNetwork = new NeuralNetwork(WeightInitializor.RANDOM_POSITIVE, 4, 2, 2, 1);
 
 		int trainingExamples = 16;
 		int trainingIterations = 2400;

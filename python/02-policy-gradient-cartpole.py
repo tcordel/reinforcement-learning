@@ -39,6 +39,13 @@ def pick_sample(s):
         probs = F.softmax(logits, dim=-1)
         # Pick up action's sample
         a = torch.multinomial(probs, num_samples=1)
+        actions = torch.tensor([1,1], dtype=torch.float).to(device)
+        actions2 = torch.tensor([0], dtype=torch.float).to(device)
+        w1 = torch.tensor([1,1], dtype=torch.float).to(device)
+        w2 = torch.tensor([-0.3], dtype=torch.float).to(device)
+        actions2 = torch.tensor([1], dtype=torch.float).to(device)
+        log_probs1 = -F.cross_entropy(w1, actions, reduction="none")
+        log_probs2 = -F.cross_entropy(w2, actions2, reduction="none")
         # Return
         return a.tolist()[0]
 
@@ -61,6 +68,7 @@ for i in range(2000):
         done = term or trunc
         actions.append(a)
         rewards.append(r)
+        break
 
     #
     # Get cumulative rewards
