@@ -20,9 +20,9 @@ public class DQN {
 	double epsilon = 1;
 	double epsilonFinal = 0.1;
 	int numEpisodes = 15000;
-	double epsilonDecay = epsilon / (numEpisodes / 5);
-	int batchSize = 64;
-	int optimizationIteration = 30;
+	double epsilonDecay = epsilon / (numEpisodes / 2);
+	int batchSize = 20;	
+	int optimizationIteration = 15;
 	int samplingSize = batchSize * optimizationIteration;
 
 	private final NeuralNetwork qModel;

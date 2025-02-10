@@ -231,6 +231,7 @@ public class ChatGPT {
 				samples.get(ib).reward += samples.get(ib + 1).reward * gamma;
 			}
 
+
 			double[][] inputs = samples.stream()
 				.map(d -> d.state)
 				.toArray(size -> new double[size][]);

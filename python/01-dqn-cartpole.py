@@ -198,8 +198,8 @@ for _ in range(15000):
         epsilon -= epsilon_decay
 
     # stop if reward mean > 495.0
-    if np.average(reward_records[-200:]) > 495.0:
-        break
+    # if np.average(reward_records[-200:]) > 495.0:
+    #     break
 
 print("\nDone")
 

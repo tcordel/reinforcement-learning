@@ -150,11 +150,11 @@ public class NeuralNetwork {
 		for (int layer = 0; layer < weights.length; layer++) {
 			for (int j = 0; j < weights[layer].length; j++) {
 				for (int k = 0; k < weights[layer][j].length; k++) {
-					weights[layer][j][k] += -eta * cumulDeltas[layer][k] * o[layer][j] ;
+					weights[layer][j][k] += -eta * cumulDeltas[layer][k] * o[layer][j] / ins.size();
 				}
 			}
 			for (int ds = 0; ds < biases[layer].length; ds++) {
-				biases[layer][ds] += -eta * cumulDeltas[layer][ds] ;
+				biases[layer][ds] += -eta * cumulDeltas[layer][ds] / ins.size();
 			}
 		}
 		return o[o.length - 1];
