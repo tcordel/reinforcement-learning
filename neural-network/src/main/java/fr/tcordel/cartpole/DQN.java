@@ -20,9 +20,9 @@ public class DQN {
 	double epsilon = 1;
 	double epsilonFinal = 0.1;
 	int numEpisodes = 15000;
-	double epsilonDecay = epsilon / (numEpisodes / 2);
-	int batchSize = 20;	
-	int optimizationIteration = 15;
+	double epsilonDecay = epsilon / (3000);
+	int batchSize = 64;	
+	int optimizationIteration = 30;
 	int samplingSize = batchSize * optimizationIteration;
 
 	private final NeuralNetwork qModel;
@@ -36,7 +36,7 @@ public class DQN {
 	}
 
 	DQN() {
-		qModel = new NeuralNetwork(WeightInitializor.RANDOM, 4, 64, 2);
+		qModel = new NeuralNetwork(WeightInitializor.ZERO, 4, 64, 2);
 		qModel.setActivationFonctions(ActivationFonction.RELU, ActivationFonction.NONE);
 		qTargetModel = new NeuralNetwork(qModel);
 		initAdam();
@@ -132,7 +132,7 @@ public class DQN {
 			System.out.println(
 					"Run iteration %d rewards %f epsilon %f".formatted(
 							rewards.size(), evaluate(cartPole), epsilon));
-			if (rewards.size() % 50 == 0) {
+			if (rewards.size() % 100 == 0) {
 				qTargetModel.load(qModel);
 			}
 
@@ -166,65 +166,65 @@ public class DQN {
 				}).toList();
 		qModel.trainMse(ins, outs, oneHots);
 	}
-
-	private void optimizeSGD(List<Dump> subList) {
-		double[][] w1 = qModel.weights[0];
-		double[][] w2 = qModel.weights[1];
-		double[][] gradW1 = NeuralNetwork.init(w1);
-		double[][] gradW2 = NeuralNetwork.init(w2);
-		double[] hidden = qModel.o[1];
-		double[] gradHidden = new double[hidden.length];
-		double deltaTotal = 0;
-		for (Dump dump : subList) {
-
-			double[] qValues = qModel.predict(dump.state());
-			double qValueSelected = qValues[dump.action()];
-
-			double target = dump.reward()
-					+ gamma * (1 - dump.done()) * Arrays.stream(qTargetModel.predict(dump.newState())).max().orElse(0d);
-
-			double delta = target - qValueSelected;
-			deltaTotal += delta;
-
-			double[] hidden1 = qModel.o[1];
-			double[] gradHidden1 = new double[hidden1.length];
-
-			for (int i = 0; i < gradW2.length; i++) {
-				gradW2[i][dump.action()] += delta * hidden1[i];
-			}
-
-			for (int i = 0; i < gradHidden1.length; i++) {
-				gradHidden1[i] = delta * w2[i][dump.action()] * ActivationFonction.RELU.backward(hidden1[i]);
-				// gradHidden[i] += gradHidden1[i];
-			}
-
-			for (int i = 0; i < gradW1.length; i++) {
-				for (int j1 = 0; j1 < gradW1[i].length; j1++) {
-					gradW1[i][j1] += dump.state()[i] * gradHidden1[j1];
-				}
-			}
-
-		}
-
-		for (int i = 0; i < gradW2.length; i++) {
-			for (int j = 0; j < gradW2[i].length; j++) {
-				w2[i][j] += alpha * gradW2[i][j] / subList.size();
-			}
-		}
-
-		for (int i = 0; i < gradW1.length; i++) {
-			for (int j = 0; j < gradW1[i].length; j++) {
-				w1[i][j] += alpha * gradW1[i][j] / subList.size();
-			}
-		}
-		for (int i = 0; i < gradHidden.length; i++) {
-			qModel.biases[0][i] += alpha * gradHidden[i] / subList.size();
-		}
-		for (int i = 0; i < qModel.biases[1].length; i++) {
-			qModel.biases[1][i] += alpha * deltaTotal / subList.size();
-		}
-
-	}
+	//
+	// private void optimizeSGD(List<Dump> subList) {
+	// 	double[][] w1 = qModel.weights[0];
+	// 	double[][] w2 = qModel.weights[1];
+	// 	double[][] gradW1 = NeuralNetwork.init(w1);
+	// 	double[][] gradW2 = NeuralNetwork.init(w2);
+	// 	double[] hidden = qModel.o[1];
+	// 	double[] gradHidden = new double[hidden.length];
+	// 	double deltaTotal = 0;
+	// 	for (Dump dump : subList) {
+	//
+	// 		double[] qValues = qModel.predict(dump.state());
+	// 		double qValueSelected = qValues[dump.action()];
+	//
+	// 		double target = dump.reward()
+	// 				+ gamma * (1 - dump.done()) * Arrays.stream(qTargetModel.predict(dump.newState())).max().orElse(0d);
+	//
+	// 		double delta = target - qValueSelected;
+	// 		deltaTotal += delta;
+	//
+	// 		double[] hidden1 = qModel.o[1];
+	// 		double[] gradHidden1 = new double[hidden1.length];
+	//
+	// 		for (int i = 0; i < gradW2.length; i++) {
+	// 			gradW2[i][dump.action()] += delta * hidden1[i];
+	// 		}
+	//
+	// 		for (int i = 0; i < gradHidden1.length; i++) {
+	// 			gradHidden1[i] = delta * w2[i][dump.action()] * ActivationFonction.RELU.backward(hidden1[i]);
+	// 			// gradHidden[i] += gradHidden1[i];
+	// 		}
+	//
+	// 		for (int i = 0; i < gradW1.length; i++) {
+	// 			for (int j1 = 0; j1 < gradW1[i].length; j1++) {
+	// 				gradW1[i][j1] += dump.state()[i] * gradHidden1[j1];
+	// 			}
+	// 		}
+	//
+	// 	}
+	//
+	// 	for (int i = 0; i < gradW2.length; i++) {
+	// 		for (int j = 0; j < gradW2[i].length; j++) {
+	// 			w2[i][j] += alpha * gradW2[i][j] / subList.size();
+	// 		}
+	// 	}
+	//
+	// 	for (int i = 0; i < gradW1.length; i++) {
+	// 		for (int j = 0; j < gradW1[i].length; j++) {
+	// 			w1[i][j] += alpha * gradW1[i][j] / subList.size();
+	// 		}
+	// 	}
+	// 	for (int i = 0; i < gradHidden.length; i++) {
+	// 		qModel.biases[0][i] += alpha * gradHidden[i] / subList.size();
+	// 	}
+	// 	for (int i = 0; i < qModel.biases[1].length; i++) {
+	// 		qModel.biases[1][i] += alpha * deltaTotal / subList.size();
+	// 	}
+	//
+	// }
 
 	double beta1 = 0.9;
 	double beta2 = 0.999;
