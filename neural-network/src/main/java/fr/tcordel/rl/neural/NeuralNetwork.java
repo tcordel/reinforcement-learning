@@ -1,6 +1,7 @@
 package fr.tcordel.rl.neural;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.DoubleSupplier;
@@ -10,7 +11,7 @@ public class NeuralNetwork {
 
 	private final int[] layers;
 	// private final double eta = 0.0005d;
-	private final double eta = 0.0005d;
+	private final double eta = 0.001d;
 	public double[][] o;
 	double[][] deltas;
 	// layer, output, input
@@ -50,7 +51,7 @@ public class NeuralNetwork {
 		return init;
 	}
 
-	private void copy(double[][] from, double[][] to) {
+	private static void copy(double[][] from, double[][] to) {
 		for (int i = 0; i < from.length; i++) {
 			System.arraycopy(from[i], 0, to[i], 0, from[i].length);
 		}
@@ -110,13 +111,15 @@ public class NeuralNetwork {
 	}
 
 	public double[] train(double[] ins, double[] out) {
-		return train(List.of(ins), List.of(out),
+		return trainMse(List.of(ins), List.of(out),
 				List.of(IntStream.range(0, out.length).map(i -> 1).toArray()));
 	}
 
-	public double[] train(List<double[]> ins, List<double[]> outs, List<int[]> oneHots) {
+	public double[] trainMse(List<double[]> ins, List<double[]> outs, List<int[]> oneHots) {
 
-		double[][] cumulDeltas = init(deltas);
+
+		List<double[][]> deltaList = new ArrayList<>();
+		List<double[][]> oList = new ArrayList<>();
 
 		for (int i = 0; i < ins.size(); i++) {
 			for (int j = 0; j < deltas.length; j++) {
@@ -133,7 +136,7 @@ public class NeuralNetwork {
 				for (int nodeIndex = 0; nodeIndex < deltas[layer].length; nodeIndex++) {
 					deltas[layer][nodeIndex] = activationFonctions[index - 1].backward(o[index][nodeIndex]);
 					if (index == o.length - 1) {
-						deltas[layer][nodeIndex] *= (o[index][nodeIndex] - out[nodeIndex]) * oneHot[nodeIndex];
+						deltas[layer][nodeIndex] *= (2 / ins.size()) * (o[index][nodeIndex] - out[nodeIndex]) * oneHot[nodeIndex];
 					} else {
 						double nextLayerWeight = 0;
 						for (int nextLayerNodeIndex = 0; nextLayerNodeIndex < deltas[index].length; nextLayerNodeIndex++) {
@@ -142,22 +145,36 @@ public class NeuralNetwork {
 						}
 						deltas[layer][nodeIndex] *= nextLayerWeight;
 					}
-					cumulDeltas[layer][nodeIndex] += deltas[layer][nodeIndex];
 				}
 			}
+			oList.add(clone(o));
+			deltaList.add(clone(deltas));
 		}
 
 		for (int layer = 0; layer < weights.length; layer++) {
 			for (int j = 0; j < weights[layer].length; j++) {
 				for (int k = 0; k < weights[layer][j].length; k++) {
-					weights[layer][j][k] += -eta * cumulDeltas[layer][k] * o[layer][j] / ins.size();
+					for (int l = 0; l < oList.size(); l++) {
+						double dW = oList.get(l)[layer][j] * deltaList.get(l)[layer][k];
+						weights[layer][j][k] += -eta * dW / ins.size();
+					}
 				}
 			}
 			for (int ds = 0; ds < biases[layer].length; ds++) {
-				biases[layer][ds] += -eta * cumulDeltas[layer][ds] / ins.size();
+					double dB = 0d;
+					for (int l = 0; l < oList.size(); l++) {
+						dB += deltaList.get(l)[layer][ds];
+					}
+				biases[layer][ds] += -eta * dB / ins.size();
 			}
 		}
 		return o[o.length - 1];
+	}
+
+	public static double[][] clone(double[][] ds) {
+		double[][] clone = init(ds);
+		copy(ds, clone);
+		return clone;
 	}
 
 	public double[] predict(double[] ins) {

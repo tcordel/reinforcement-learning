@@ -164,7 +164,7 @@ public class DQN {
 					action[dump.action()] = 1;
 					return action;
 				}).toList();
-		qModel.train(ins, outs, oneHots);
+		qModel.trainMse(ins, outs, oneHots);
 	}
 
 	private void optimizeSGD(List<Dump> subList) {
