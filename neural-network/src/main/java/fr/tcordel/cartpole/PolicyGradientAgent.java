@@ -1,6 +1,7 @@
 package fr.tcordel.cartpole;
 
 import fr.tcordel.cartpole.CartPole.StepResult;
+import fr.tcordel.rl.neural.NeuralNetwork;
 import fr.tcordel.utils.Matplot;
 
 import java.util.ArrayList;
@@ -10,8 +11,6 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-
-
 
 class AdamOptimizer {
 	private double lr, beta1, beta2, eps;
@@ -183,6 +182,10 @@ class ReplayMemory {
 		buffer.add(new double[][] { state, { action }, { reward }, nextState, { done ? 1.0 : 0.0 } });
 	}
 
+	public List<double[][]> getAll() {
+		return buffer;
+	}
+
 	public List<double[][]> sample(int sampleSize) {
 		Random rand = new Random();
 		List<double[][]> sample = new ArrayList<>();
@@ -195,30 +198,26 @@ class ReplayMemory {
 	public int length() {
 		return buffer.size();
 	}
+
+	public void reset() {
+		buffer.clear();
+	}
 }
 
-public class QLearningAgent {
+public class PolicyGradientAgent {
 	private static final double GAMMA = 0.99;
-	private static final int BATCH_SIZE = 64;
-	private static final int SAMPLING_SIZE = BATCH_SIZE * 30;
-	private static final double EPSILON_START = 1.0;
-	private static final double EPSILON_DECAY = EPSILON_START / 3000;
-	private static final double EPSILON_FINAL = 0.1;
+	private final Random random = new Random();
 
-	private QNet qModel;
-	private QNet qTargetModel;
+	private QNet policy;
 	private ReplayMemory memory;
-	private double epsilon;
 
-	public QLearningAgent() {
-		qModel = new QNet(4, 64, 2, 0.0005);
-		qTargetModel = new QNet(4, 64, 2, 0.0005);
-		qTargetModel.copyFrom(qModel);
+	public PolicyGradientAgent() {
+		policy = new QNet(4, 64, 2, 0.001);
 		memory = new ReplayMemory(10000);
-		epsilon = EPSILON_START;
 	}
+
 	public static void main(String[] args) {
-		new QLearningAgent().train(new CartPole(), 15000);
+		new PolicyGradientAgent().train(new CartPole(), 15000);
 
 	}
 
@@ -239,26 +238,24 @@ public class QLearningAgent {
 		}
 
 		double[][] hidden = relu(QNet.matrixAdd(matrixDot(states, model.weights1, batchSize, 64, 4), model.bias1));
-		double[][] qVals = QNet.matrixAdd(matrixDot(hidden, model.weights2, batchSize, 2, 64), model.bias2);
+		double[][] logits = QNet.matrixAdd(matrixDot(hidden, model.weights2, batchSize, 2, 64), model.bias2);
+		double[][] probs = softmax(logits);
 
-		double[][] nextHidden = relu(
-				QNet.matrixAdd(matrixDot(nextStates, qTargetModel.weights1, batchSize, 64, 4), qTargetModel.bias1));
-		double[][] nextQVals = QNet.matrixAdd(matrixDot(nextHidden, qTargetModel.weights2, batchSize, 2, 64), qTargetModel.bias2);
-
-		double[] targetQVals = new double[batchSize];
+		double[][] dLogit = new double[batchSize][2];
 		for (int i = 0; i < batchSize; i++) {
-			targetQVals[i] = rewards[i] + GAMMA * (1 - dones[i]) * Arrays.stream(nextQVals[i]).max().getAsDouble();
+			for (int j = 0; j < 2; j++) {
+				dLogit[i][j] = probs[i][j];
+				if (actions[i] == j) {
+					dLogit[i][j] -= 1;
+				}
+				dLogit[i][j] *= rewards[i];
+			}
 		}
 
-		double[][] lossGrad = new double[batchSize][2];
-		for (int i = 0; i < batchSize; i++) {
-			lossGrad[i][actions[i]] = 2 * (qVals[i][actions[i]] - targetQVals[i]) / batchSize;
-		}
+		double[][] gradW2 = matrixDot(transpose(hidden, batchSize, 64), dLogit, 64, 2, batchSize);
+		double[] gradB2 = sumRows(dLogit);
 
-		double[][] gradW2 = matrixDot(transpose(hidden, batchSize, 64), lossGrad, 64, 2, batchSize);
-		double[] gradB2 = sumRows(lossGrad);
-
-		double[][] hiddenGrad = matrixDot(lossGrad, transpose(model.weights2, 64, 2), batchSize, 64, 2);
+		double[][] hiddenGrad = matrixDot(dLogit, transpose(model.weights2, 64, 2), batchSize, 64, 2);
 		for (int i = 0; i < batchSize; i++) {
 			for (int j = 0; j < 64; j++) {
 				hiddenGrad[i][j] *= (hidden[i][j] > 0 ? 1 : 0);
@@ -271,19 +268,87 @@ public class QLearningAgent {
 		return Map.of("w1", gradW1, "b1", new double[][] { gradB1 }, "w2", gradW2, "b2", new double[][] { gradB2 });
 	}
 
+	public static double[] crossEntropyLoss(double[][] logits, int[] targets) {
+		int batchSize = logits.length;
+		int numClasses = logits[0].length;
+
+		// Appliquer log-softmax
+		double[][] logSoftmax = logSoftmax(logits, batchSize, numClasses);
+
+		// Calcul de la perte NLL pour chaque exemple du batch
+		double[] losses = new double[batchSize];
+		for (int i = 0; i < batchSize; i++) {
+			losses[i] = -logSoftmax[i][targets[i]]; // Prendre la valeur du log-softmax pour la classe cible
+		}
+
+		return losses; // Retourner un tableau avec la perte de chaque échantillon
+	}
+
+	private static double[][] logSoftmax(double[][] logits, int batchSize, int numClasses) {
+		double[][] logSoftmax = new double[batchSize][numClasses];
+
+		for (int i = 0; i < batchSize; i++) {
+			double maxLogit = Arrays.stream(logits[i]).max().getAsDouble(); // Stabilité numérique
+
+			// Exponentielle normalisée
+			double sumExp = 0.0;
+			for (int j = 0; j < numClasses; j++) {
+				sumExp += Math.exp(logits[i][j] - maxLogit);
+			}
+
+			double logSumExp = Math.log(sumExp);
+			for (int j = 0; j < numClasses; j++) {
+				logSoftmax[i][j] = logits[i][j] - maxLogit - logSumExp;
+			}
+		}
+
+		return logSoftmax;
+	}
+
 	private void optimize() {
-		List<double[][]> batch = memory.sample(SAMPLING_SIZE);
-		Map<String, double[][]> grads = computeGradients(qModel, batch);
-		qModel.update(grads);
+		List<double[][]> frames = memory.getAll();
+		for (int ib = frames.size() - 2; ib >= 0; ib--) {
+			frames.get(ib)[2][0] += frames.get(ib + 1)[2][0] * GAMMA;
+		}
+		Map<String, double[][]> grads = computeGradients(policy, frames);
+		policy.update(grads);
 	}
 
 	private int pickAction(double[] state) {
-		if (Math.random() > epsilon) {
-			double[] qValues = qModel.forward(new double[][] {state})[0];
-			return maxIndex(qValues);
-		} else {
-			return new Random().nextInt(2);
+		double[] predict = policy.forward(new double[][] { state })[0];
+		double total;
+		double[] probs = softmax(predict);
+		double rand = random.nextDouble();
+		total = 0;
+		for (int i = 0; i < predict.length; i++) {
+			total += probs[i];
+			if (rand <= total) {
+				return i;
+			}
 		}
+
+		throw new IllegalStateException("rand not found %f for total %f".formatted(rand, total));
+	}
+
+	public static double[][] softmax(double[][] logits) {
+		double[][] softmax = new double[logits.length][];
+		for (int i = 0; i < softmax.length; i++) {
+			softmax[i] = softmax(logits[i]);
+		}
+		return softmax;
+	}
+	public static double[] softmax(double[] logits) {
+		double[] probs = new double[2];
+		double total = 0;
+		for (int i = 0; i < logits.length; i++) {
+			double exp = Math.exp(logits[i]);
+			probs[i] = exp;
+			total += exp;
+		}
+		for (int i = 0; i < logits.length; i++) {
+			probs[i] = probs[i] / total;
+		}
+		return probs;
 	}
 
 	public void train(CartPole env, int iterations) {
@@ -291,41 +356,30 @@ public class QLearningAgent {
 
 		for (int iter = 0; iter < iterations; iter++) {
 			double[] state = env.reset();
+			boolean dead = false;
 			int totalReward = 0;
+			memory.reset();
 
-			for (int step = 0; step < 500; step++) {
+			while (!dead) {
 				int action = pickAction(state);
 				double[] nextState;
 				double reward;
-				boolean terminal;
 
 				// Simulation step
 				StepResult result = env.step(action);
 				nextState = Arrays.copyOfRange(result.state(), 0, 4);
 				reward = result.reward();
-				terminal = result.truncated() || result.terminated();
-				memory.add(state, action, reward, nextState, terminal);
+				dead = result.truncated() || result.terminated();
+				memory.add(state, action, reward, nextState, dead);
 				totalReward += reward;
 				state = nextState;
-
-				if (terminal)
-					break;
 			}
 
-			if (memory.length() >= 2000) {
-				optimize();
-			}
+			optimize();
 
 			rewardRecords.add(totalReward);
-			System.out.printf("Iteration %d - Reward: %d - Epsilon: %.5f%n", iter + 1, totalReward, epsilon);
+			System.out.printf("Iteration %d - Reward: %d%n", iter + 1, totalReward);
 
-			if ((iter + 1) % 50 == 0) {
-				qTargetModel.copyFrom(qModel);
-			}
-
-			if (epsilon > EPSILON_FINAL) {
-				epsilon -= EPSILON_DECAY;
-			}
 			if (rewardRecords.size() > 200 && rewardRecords.subList(rewardRecords.size() - 200, rewardRecords.size())
 					.stream().mapToDouble(Integer::doubleValue).average().orElse(0) >= 495) {
 				break;
