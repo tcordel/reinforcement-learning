@@ -11,10 +11,30 @@ public class TicTacToe implements Game {
 	public static final char O = Result.O.toString().charAt(0);
 	char[][] board = new char[3][3];
 
+	public double[] reset() {
+		this.resetBoard();
+		return boardToState();
+	}
+
 	public void resetBoard() {
 		for (int i = 0; i < board.length; i++) {
 			Arrays.fill(board[i], 0, board[i].length, EMPTY_CELL);
 		}
+	}
+
+	public double[] boardToState() {
+		double[] state = new double[18];
+		for (int i = 0; i < board.length; i++) {
+			for (int j = 0; j < board[i].length; j++) {
+				if (board[i][j] == X) {
+					state[2 * (i + j)] = 1d;
+				} else if (board[i][j] == O) {
+					state[2 * (i + j) + 1] = 1d;
+				}
+			}
+		}
+		return state;
+
 	}
 
 	@Override
@@ -97,5 +117,7 @@ public class TicTacToe implements Game {
 		}
 		return display;
 
+	}
+	public static record StepResult(double[] state, double reward, boolean terminated, boolean truncated) {
 	}
 }
