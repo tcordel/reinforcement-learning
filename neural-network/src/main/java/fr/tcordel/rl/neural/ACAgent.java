@@ -52,10 +52,14 @@ public class ACAgent implements Agent {
 		TicTacToe game = new TicTacToe();
 		ACAgent agent = new ACAgent(game);
 		Agent agentOld = new RandomAgent(game, TicTacToe.X);
-		for (int i = 0; i < 100; i++) {
-			agent.train(agentOld, 3000);
+		for (int j = 0; j < 5; j++) {
+			for (int i = 0; i < 100; i++) {
+				agent.train(agentOld, 3000);
+				agent = new ACAgent(agent);
+			}
+			System.out.println("Change opp");
 			agentOld = agent;
-			agent = new ACAgent(agent);
+
 		}
 		// agent.train(game, 1);
 
