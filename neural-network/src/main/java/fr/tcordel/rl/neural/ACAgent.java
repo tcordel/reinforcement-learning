@@ -2,9 +2,8 @@ package fr.tcordel.rl.neural;
 
 import fr.tcordel.game.Result;
 import fr.tcordel.game.TicTacToe;
+import fr.tcordel.rl.Agent;
 import fr.tcordel.rl.dummy.RandomAgent;
-import fr.tcordel.rl.qlearning.QAgent;
-import fr.tcordel.utils.Matplot;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -16,29 +15,51 @@ import java.util.Random;
 import java.util.Scanner;
 import java.util.function.BiFunction;
 
-public class ACAgent {
+public class ACAgent implements Agent {
 	private static final int STATE_SIZE = 18;
 	private static final int OUTPUT_SIZE = 9;
 	private static final double GAMMA = 0.99;
 	private final Random random = new Random();
+	private final TicTacToe game;
+
+	private char player = TicTacToe.X;
+
+	@Override
+	public void setPlayer(char player) {
+		this.player = player;
+	}
 
 	int colsB = 64;
 	private QNet actor;
 	private QNet critic;
 	private ReplayMemory memory;
 
-	public ACAgent() {
+	public ACAgent(TicTacToe game) {
+		this.game = game;
 		actor = new QNet(STATE_SIZE, colsB, OUTPUT_SIZE, 0.001);
 		critic = new QNet(STATE_SIZE, colsB, OUTPUT_SIZE, 0.001);
 		memory = new ReplayMemory(10000);
 	}
 
+	public ACAgent(ACAgent from) {
+		this(from.game);
+		actor.copyFrom(from.actor);
+		critic.copyFrom(from.critic);
+
+	}
+
 	public static void main(String[] args) {
 		TicTacToe game = new TicTacToe();
-		ACAgent agent = new ACAgent();
-		agent.train(game, 3000);
+		ACAgent agent = new ACAgent(game);
+		Agent agentOld = new RandomAgent(game, TicTacToe.X);
+		for (int i = 0; i < 100; i++) {
+			agent.train(agentOld, 3000);
+			agentOld = agent;
+			agent = new ACAgent(agent);
+		}
 		// agent.train(game, 1);
 
+		agent.setPlayer(TicTacToe.O);
 		Scanner in = new Scanner(System.in);
 
 		while (true) {
@@ -50,9 +71,7 @@ public class ACAgent {
 
 			while (Result.PENDING.equals(result)) {
 				if (player == TicTacToe.O) {
-					int action = agent.pickAction(game, game.boardToState());
-					System.out.println("IA : %d %d".formatted(action / 3, action % 3));
-					game.play(TicTacToe.O, action / 3, action % 3);
+					agent.play(0);
 				} else {
 					System.out.println("Choose action :");
 					System.out.println(game.toString());
@@ -288,14 +307,15 @@ public class ACAgent {
 		return probs;
 	}
 
-	public void train(TicTacToe env, int iterations) {
+	public void train(Agent randomAgent, int iterations) {
 		List<Integer> rewardRecords = new ArrayList<>();
-		RandomAgent randomAgent = new RandomAgent(env, TicTacToe.X);
+		double total = 0;
+		randomAgent.setPlayer(TicTacToe.X);
 
 		char player = TicTacToe.X;
 		for (int iter = 0; iter < iterations; iter++) {
-			double[] state = env.reset();
-			player = TicTacToe.X;
+			player = Math.random() > 0.5 ? TicTacToe.X : TicTacToe.O;
+			double[] state = game.reset(player);
 			boolean dead = false;
 			int totalReward = 0;
 			memory.reset();
@@ -304,7 +324,7 @@ public class ACAgent {
 				Result currentResult;
 				if (player == TicTacToe.X) {
 					randomAgent.play(0d);
-					currentResult = env.getResult();
+					currentResult = game.getResult();
 					dead = !currentResult.equals(Result.PENDING);
 					if (dead) {
 						double reward = currentResult.equals(Result.O) ? 1
@@ -312,14 +332,14 @@ public class ACAgent {
 						memory.updateLastReward(reward);
 					}
 				} else {
-					int action = pickAction(env, state);
+					int action = pickAction(game, state);
 					double[] nextState;
 					double reward;
 
 					// Simulation step
-					env.play(TicTacToe.O, action / 3, action % 3);
-					nextState = env.boardToState();
-					currentResult = env.getResult();
+					game.play(TicTacToe.O, action / 3, action % 3);
+					nextState = game.boardToState(TicTacToe.O);
+					currentResult = game.getResult();
 					dead = !currentResult.equals(Result.PENDING);
 					reward = currentResult.equals(Result.O) ? 1
 							: currentResult.equals(Result.X) ? -1 : currentResult.equals(Result.DROW) ? 0.3d : 0;
@@ -333,13 +353,15 @@ public class ACAgent {
 			optimize();
 
 			rewardRecords.add(totalReward);
-			System.out.printf("Iteration %d - Reward: %d%n", iter + 1, totalReward);
+			total += totalReward;
+			// System.out.printf("Iteration %d - Reward: %d%n", iter + 1, totalReward);
 
 			if (rewardRecords.size() > 200 && rewardRecords.subList(rewardRecords.size() - 200, rewardRecords.size())
 					.stream().mapToDouble(Integer::doubleValue).average().orElse(0) >= 495) {
 				break;
 			}
 		}
+		System.out.println(total / iterations);
 
 		// Matplot.print(rewardRecords.stream().mapToDouble(Integer::doubleValue).boxed().toList());
 	}
@@ -392,6 +414,18 @@ public class ACAgent {
 			}
 		}
 		return result;
+	}
+
+	@Override
+	public void play(double explorationRate) {
+		int action = pickAction(game, game.boardToState(this.player));
+		game.play(TicTacToe.O, action / 3, action % 3);
+	}
+
+	@Override
+	public void updateStrategy(double reward) {
+		// TODO Auto-generated method stub
+		throw new UnsupportedOperationException("Unimplemented method 'updateStrategy'");
 	}
 }
 
