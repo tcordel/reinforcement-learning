@@ -3,6 +3,7 @@ package fr.tcordel.rl.neural;
 import fr.tcordel.game.Result;
 import fr.tcordel.game.TicTacToe;
 import fr.tcordel.rl.dummy.RandomAgent;
+import fr.tcordel.rl.qlearning.QAgent;
 import fr.tcordel.utils.Matplot;
 
 import java.util.ArrayList;
@@ -12,6 +13,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Scanner;
 import java.util.function.BiFunction;
 
 public class ACAgent {
@@ -20,7 +22,7 @@ public class ACAgent {
 	private static final double GAMMA = 0.99;
 	private final Random random = new Random();
 
-	int colsB = 18;
+	int colsB = 64;
 	private QNet actor;
 	private QNet critic;
 	private ReplayMemory memory;
@@ -32,7 +34,39 @@ public class ACAgent {
 	}
 
 	public static void main(String[] args) {
-		new ACAgent().train(new TicTacToe(), 15000);
+		TicTacToe game = new TicTacToe();
+		ACAgent agent = new ACAgent();
+		agent.train(game, 3000);
+		// agent.train(game, 1);
+
+		Scanner in = new Scanner(System.in);
+
+		while (true) {
+			System.err.println("new game");
+			game.resetBoard();
+			Result result = game.getResult();
+
+			char player = TicTacToe.O;
+
+			while (Result.PENDING.equals(result)) {
+				if (player == TicTacToe.O) {
+					int action = agent.pickAction(game, game.boardToState());
+					System.out.println("IA : %d %d".formatted(action / 3, action % 3));
+					game.play(TicTacToe.O, action / 3, action % 3);
+				} else {
+					System.out.println("Choose action :");
+					System.out.println(game.toString());
+					String action = in.nextLine();
+					game.play(player,
+							Integer.parseInt(String.valueOf(action.charAt(0))),
+							Integer.parseInt(String.valueOf(action.charAt(1))));
+				}
+
+				player = player == TicTacToe.X ? TicTacToe.O : TicTacToe.X;
+				result = game.getResult();
+			}
+			System.out.println("win " + result);
+		}
 
 	}
 
@@ -54,7 +88,8 @@ public class ACAgent {
 
 		double[][] hidden = relu(
 				QNet.matrixAddForBias(matrixDot(states, model.weights1, batchSize, colsB, STATE_SIZE), model.bias1));
-		double[][] qVals = QNet.matrixAddForBias(matrixDot(hidden, model.weights2, batchSize, OUTPUT_SIZE, colsB), model.bias2);
+		double[][] qVals = QNet.matrixAddForBias(matrixDot(hidden, model.weights2, batchSize, OUTPUT_SIZE, colsB),
+				model.bias2);
 
 		double[] targetQVals = new double[batchSize];
 		for (int i = 0; i < batchSize; i++) {
@@ -69,14 +104,16 @@ public class ACAgent {
 		double[][] gradW2 = matrixDot(transpose(hidden, batchSize, colsB), lossGrad, colsB, OUTPUT_SIZE, batchSize);
 		double[] gradB2 = sumRows(lossGrad);
 
-		double[][] hiddenGrad = matrixDot(lossGrad, transpose(model.weights2, colsB, OUTPUT_SIZE), batchSize, colsB, OUTPUT_SIZE);
+		double[][] hiddenGrad = matrixDot(lossGrad, transpose(model.weights2, colsB, OUTPUT_SIZE), batchSize, colsB,
+				OUTPUT_SIZE);
 		for (int i = 0; i < batchSize; i++) {
 			for (int j = 0; j < colsB; j++) {
 				hiddenGrad[i][j] *= (hidden[i][j] > 0 ? 1 : 0);
 			}
 		}
 
-		double[][] gradW1 = matrixDot(transpose(states, batchSize, OUTPUT_SIZE), hiddenGrad, OUTPUT_SIZE, colsB, batchSize);
+		double[][] gradW1 = matrixDot(transpose(states, batchSize, STATE_SIZE), hiddenGrad, STATE_SIZE, colsB,
+				batchSize);
 		double[] gradB1 = sumRows(hiddenGrad);
 
 		return Map.of("w1", gradW1, "b1", new double[][] { gradB1 }, "w2", gradW2, "b2", new double[][] { gradB2 });
@@ -93,26 +130,29 @@ public class ACAgent {
 		for (int i = 0; i < batchSize; i++) {
 			states[i] = batch.get(i)[0];
 			actions[i] = (int) batch.get(i)[1][0];
-			rewards[i] = new double[] { batch.get(i)[2][0], batch.get(i)[2][0] };
+			rewards[i] = new double[OUTPUT_SIZE];
+			Arrays.fill(rewards[i], 0, OUTPUT_SIZE, batch.get(i)[2][0]);
 			nextStates[i] = batch.get(i)[3];
 			dones[i] = batch.get(i)[4][0];
 		}
 
 		double[][] hidden = relu(
 				QNet.matrixAddForBias(matrixDot(states, model.weights1, batchSize, colsB, STATE_SIZE), model.bias1));
-		double[][] logits = QNet.matrixAddForBias(matrixDot(hidden, model.weights2, batchSize, OUTPUT_SIZE, colsB), model.bias2);
+		double[][] logits = QNet.matrixAddForBias(matrixDot(hidden, model.weights2, batchSize, OUTPUT_SIZE, colsB),
+				model.bias2);
 		double[][] probs = softmax(logits);
 
 		double[][] valuesHidden = relu(
 				QNet.matrixAddForBias(matrixDot(states, critic.weights1, batchSize, colsB, STATE_SIZE), critic.bias1));
-		double[][] values = QNet.matrixAddForBias(matrixDot(valuesHidden, critic.weights2, batchSize, OUTPUT_SIZE, colsB),
+		double[][] values = QNet.matrixAddForBias(
+				matrixDot(valuesHidden, critic.weights2, batchSize, OUTPUT_SIZE, colsB),
 				critic.bias2);
 
 		double[][] advantages = QNet.matrixOperation(rewards, values, (r, v) -> r - v);
 
-		double[][] dLogit = new double[batchSize][2];
+		double[][] dLogit = new double[batchSize][OUTPUT_SIZE];
 		for (int i = 0; i < batchSize; i++) {
-			for (int j = 0; j < 2; j++) {
+			for (int j = 0; j < OUTPUT_SIZE; j++) {
 				dLogit[i][j] = probs[i][j];
 				if (actions[i] == j) {
 					dLogit[i][j] -= 1;
@@ -124,14 +164,16 @@ public class ACAgent {
 		double[][] gradW2 = matrixDot(transpose(hidden, batchSize, colsB), dLogit, colsB, OUTPUT_SIZE, batchSize);
 		double[] gradB2 = sumRows(dLogit);
 
-		double[][] hiddenGrad = matrixDot(dLogit, transpose(model.weights2, colsB, OUTPUT_SIZE), batchSize, colsB, OUTPUT_SIZE);
+		double[][] hiddenGrad = matrixDot(dLogit, transpose(model.weights2, colsB, OUTPUT_SIZE), batchSize, colsB,
+				OUTPUT_SIZE);
 		for (int i = 0; i < batchSize; i++) {
 			for (int j = 0; j < colsB; j++) {
 				hiddenGrad[i][j] *= (hidden[i][j] > 0 ? 1 : 0);
 			}
 		}
 
-		double[][] gradW1 = matrixDot(transpose(states, batchSize, OUTPUT_SIZE), hiddenGrad, STATE_SIZE, colsB, batchSize);
+		double[][] gradW1 = matrixDot(transpose(states, batchSize, STATE_SIZE), hiddenGrad, STATE_SIZE, colsB,
+				batchSize);
 		double[] gradB1 = sumRows(hiddenGrad);
 
 		return Map.of("w1", gradW1, "b1", new double[][] { gradB1 }, "w2", gradW2, "b2", new double[][] { gradB2 });
@@ -185,10 +227,14 @@ public class ACAgent {
 		actor.update(actorGrads);
 	}
 
-	private int pickAction(double[] state) {
+	private int pickAction(TicTacToe game, double[] state) {
 		double[] predict = actor.forward(new double[][] { state })[0];
+		double[] actionsHotspot = game.getActionsHotspot();
+		// for (int i = 0; i < predict.length; i++) {
+		// predict[i] *= actionsHotspot[i];
+		// }
 		double total;
-		double[] probs = softmax(predict);
+		double[] probs = softmax(predict, actionsHotspot);
 		double rand = random.nextDouble();
 		total = 0;
 		for (int i = 0; i < predict.length; i++) {
@@ -197,6 +243,7 @@ public class ACAgent {
 				return i;
 			}
 		}
+		double[] probs2 = softmax(predict, actionsHotspot);
 
 		throw new IllegalStateException("rand not found %f for total %f".formatted(rand, total));
 	}
@@ -207,6 +254,24 @@ public class ACAgent {
 			softmax[i] = softmax(logits[i]);
 		}
 		return softmax;
+	}
+
+	public static double[] softmax(double[] logits, double[] hots) {
+		double[] probs = new double[logits.length];
+		double total = 0;
+		for (int i = 0; i < logits.length; i++) {
+			if (hots[i] == 1) {
+				double exp = Math.exp(logits[i]);
+				probs[i] = exp;
+				total += exp;
+			}
+		}
+		for (int i = 0; i < logits.length; i++) {
+			if (hots[i] == 1) {
+				probs[i] = probs[i] / total;
+			}
+		}
+		return probs;
 	}
 
 	public static double[] softmax(double[] logits) {
@@ -247,7 +312,7 @@ public class ACAgent {
 						memory.updateLastReward(reward);
 					}
 				} else {
-					int action = pickAction(state);
+					int action = pickAction(env, state);
 					double[] nextState;
 					double reward;
 
@@ -276,7 +341,7 @@ public class ACAgent {
 			}
 		}
 
-		Matplot.print(rewardRecords.stream().mapToDouble(Integer::doubleValue).boxed().toList());
+		// Matplot.print(rewardRecords.stream().mapToDouble(Integer::doubleValue).boxed().toList());
 	}
 
 	private int maxIndex(double[] array) {
@@ -363,11 +428,14 @@ class AdamOptimizer {
 
 			// Mise à jour des moments m et v
 			for (int i = 0; i < param.length; i++) {
-				for (int j = 0; j < param[0].length; j++) {
+				for (int j = 0; j < param[i].length; j++) {
 					// Mise à jour de la moyenne des gradients (moment de premier ordre)
-					m.get(key)[i][j] = beta1 * m.get(key)[i][j] + (1 - beta1) * grad[i][j];
+					double d = grad[i][j];
+					m.get(key)[i][j] = beta1
+							* m.get(key)[i][j]
+							+ (1 - beta1) * d;
 					// Mise à jour de la variance des gradients (moment de second ordre)
-					v.get(key)[i][j] = beta2 * v.get(key)[i][j] + (1 - beta2) * grad[i][j] * grad[i][j];
+					v.get(key)[i][j] = beta2 * v.get(key)[i][j] + (1 - beta2) * d * d;
 
 					// Biais corrigé pour m et v
 					mHat[i][j] = m.get(key)[i][j] / (1 - Math.pow(beta1, t));

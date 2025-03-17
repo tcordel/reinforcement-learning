@@ -89,13 +89,25 @@ public class TicTacToe implements Game {
 		board[x][y] = player;
 	}
 
+	public double[] getActionsHotspot() {
+		double[] hots = new double[9];
+		for (int x = 0; x < board.length; x++) {
+			for (int y = 0; y < board.length; y++) {
+				char c = board[x][y];
+				if (c == EMPTY_CELL) {
+					hots[3 * x + y] = 1;
+				}
+			}
+		}
+		return hots;
+	}
+
 	public List<String> getAllAvailableActions() {
 		List<String> actions = new ArrayList<>();
 
 		for (int x = 0; x < board.length; x++) {
 			for (int y = 0; y < board.length; y++) {
 				char c = board[x][y];
-				System.err.println(c);
 				if (c == EMPTY_CELL) {
 					actions.add("%d%d".formatted(x, y));
 				}
@@ -118,6 +130,7 @@ public class TicTacToe implements Game {
 		return display;
 
 	}
+
 	public static record StepResult(double[] state, double reward, boolean terminated, boolean truncated) {
 	}
 }
