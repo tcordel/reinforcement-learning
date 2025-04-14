@@ -22,7 +22,7 @@ public class ACAgent implements Agent {
 	private final Random random = new Random();
 	private final TicTacToe game;
 
-	private char player = TicTacToe.X;
+	char player = TicTacToe.X;
 
 	@Override
 	public void setPlayer(char player) {
@@ -31,7 +31,7 @@ public class ACAgent implements Agent {
 
 	int colsB = 64;
 	private QNet actor;
-	private QNet critic;
+	QNet critic;
 	private ReplayMemory memory;
 
 	public ACAgent(TicTacToe game) {
@@ -51,7 +51,8 @@ public class ACAgent implements Agent {
 	public static void main(String[] args) {
 		TicTacToe game = new TicTacToe();
 		ACAgent agent = new ACAgent(game);
-		Agent agentOld = new RandomAgent(game, TicTacToe.X);
+		Agent random =new RandomAgent(game, TicTacToe.X);
+		Agent agentOld = random;
 		for (int j = 0; j < 5; j++) {
 			for (int i = 0; i < 100; i++) {
 				agent.train(agentOld, 3000);
@@ -64,36 +65,36 @@ public class ACAgent implements Agent {
 		// agent.train(game, 1);
 
 		agent.setPlayer(TicTacToe.O);
-		Scanner in = new Scanner(System.in);
+		try (Scanner in = new Scanner(System.in)) {
+			while (true) {
+				System.err.println("new game");
+				game.resetBoard();
+				Result result = game.getResult();
 
-		while (true) {
-			System.err.println("new game");
-			game.resetBoard();
-			Result result = game.getResult();
+				char player = TicTacToe.O;
 
-			char player = TicTacToe.O;
+				while (Result.PENDING.equals(result)) {
+					if (player == TicTacToe.O) {
+						agent.play(0);
+					} else {
+						System.out.println("Choose action :");
+						System.out.println(game.toString());
+						String action = in.nextLine();
+						game.play(player,
+								Integer.parseInt(String.valueOf(action.charAt(0))),
+								Integer.parseInt(String.valueOf(action.charAt(1))));
+					}
 
-			while (Result.PENDING.equals(result)) {
-				if (player == TicTacToe.O) {
-					agent.play(0);
-				} else {
-					System.out.println("Choose action :");
-					System.out.println(game.toString());
-					String action = in.nextLine();
-					game.play(player,
-							Integer.parseInt(String.valueOf(action.charAt(0))),
-							Integer.parseInt(String.valueOf(action.charAt(1))));
+					player = player == TicTacToe.X ? TicTacToe.O : TicTacToe.X;
+					result = game.getResult();
 				}
-
-				player = player == TicTacToe.X ? TicTacToe.O : TicTacToe.X;
-				result = game.getResult();
+				System.out.println("win " + result);
 			}
-			System.out.println("win " + result);
 		}
 
 	}
 
-	private Map<String, double[][]> computeCriticGradients(QNet model, List<double[][]> batch) {
+	Map<String, double[][]> computeCriticGradients(QNet model, List<double[][]> batch) {
 		int batchSize = batch.size();
 		double[][] states = new double[batchSize][STATE_SIZE];
 		int[] actions = new int[batchSize];
