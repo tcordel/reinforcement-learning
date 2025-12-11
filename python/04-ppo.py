@@ -129,20 +129,24 @@ for i in range(5000):
     # Calculate KL-div for Categorical distribution (see above)
     l0 = logits_old - torch.amax(logits_old, dim=1, keepdim=True) # reduce quantity
     l1 = logits_new - torch.amax(logits_new, dim=1, keepdim=True) # reduce quantity
+    l01 = l0 - l1
     e0 = torch.exp(l0)
     e1 = torch.exp(l1)
     e_sum0 = torch.sum(e0, dim=1, keepdim=True)
     e_sum1 = torch.sum(e1, dim=1, keepdim=True)
+    e_sum01 = e_sum1 - e_sum0
     p0 = e0 / e_sum0
     kl = torch.sum(
         p0 * (l0 - torch.log(e_sum0) - l1 + torch.log(e_sum1)),
         dim=1,
         keepdim=True)
+    # kl2 = torch.distributions.kl.kl_divergence(logits_old, logits_new)
     # Get value loss
     vf_loss = F.mse_loss(
         values_new,
         cum_rewards,
         reduction="none")
+    print(f"kl -> {kl.mean().item()}")
     # Get total loss
     loss = -advantages * prob_ratio + kl * kl_coeff + vf_loss * vf_coeff
     # Optimize

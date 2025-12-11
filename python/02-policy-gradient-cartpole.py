@@ -68,7 +68,6 @@ for i in range(2000):
         done = term or trunc
         actions.append(a)
         rewards.append(r)
-        break
 
     #
     # Get cumulative rewards
