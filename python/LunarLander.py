@@ -10,12 +10,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ActorNet(nn.Module):
-    def __init__(self, hidden_dim=8):
+    def __init__(self, l1=32, l2=16):
         super().__init__()
 
-        self.hidden = nn.Linear(8, hidden_dim)
-        self.hidden1 = nn.Linear(hidden_dim, hidden_dim)
-        self.output = nn.Linear(hidden_dim, 4)
+        self.hidden = nn.Linear(8, l1)
+        self.hidden1 = nn.Linear(l1, l2)
+        self.output = nn.Linear(l2, 4)
 
     def forward(self, s):
         outs = self.hidden(s)
@@ -27,12 +27,12 @@ class ActorNet(nn.Module):
 
 
 class ValueNet(nn.Module):
-    def __init__(self, hidden_dim=8):
+    def __init__(self, l1=32, l2=16):
         super().__init__()
 
-        self.hidden = nn.Linear(8, hidden_dim)
-        self.hidden1 = nn.Linear(hidden_dim, hidden_dim)
-        self.output = nn.Linear(hidden_dim, 1)
+        self.hidden = nn.Linear(8, l1)
+        self.hidden1 = nn.Linear(l1, l2)
+        self.output = nn.Linear(l2, 1)
 
     def forward(self, s):
         outs = self.hidden(s)
@@ -51,8 +51,9 @@ all_params = list(actor_func.parameters()) + list(value_func.parameters())
 gamma = 0.99  # discount
 kl_coeff = 0.20  # weight coefficient for KL-divergence loss
 vf_coeff = 0.30  # weight coefficient for value loss
-opt = torch.optim.AdamW(all_params, lr=0.01)
+opt = torch.optim.AdamW(all_params, lr=0.005)
 
+# Best config: ${'lr': 0.005, 'l1': 32, 'l2': 16, 'g': 0.99}
 
 # Pick up action and following properties for state (s)
 # Return :
