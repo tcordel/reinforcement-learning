@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from random import random
 from pettingzoo.classic import tictactoe_v3
 from torch import optim
 
@@ -141,9 +142,10 @@ class A2C(nn.Module):
         advantages = returns - value_preds
         advantages_actor = torch.clamp(advantages, -1.0, 1.0)
         critic_loss = (returns - value_preds).pow(2).mean()
-        actor_loss = -(
-            advantages_actor.detach() * action_log_probs
-        ).mean() - ent_coef * entropy.mean()
+        actor_loss = (
+            -(advantages_actor.detach() * action_log_probs).mean()
+            - ent_coef * entropy.mean()
+        )
         return (critic_loss, actor_loss)
 
     def update_parameters(
@@ -173,11 +175,12 @@ if torch.cuda.is_available():
     print("Using cuda")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-env = tictactoe_v3.env()#render_mode="human")
+env = tictactoe_v3.env()  # render_mode="human")
+env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 5000
-CRITIC_LR = 0.00005
-ACTOR_LR = 0.005
+EPISODE = 35000
+CRITIC_LR = 0.0005
+ACTOR_LR = 0.001
 
 GAMMA = 0.9
 LAM = 0  # hyperparameter for GAE
@@ -206,24 +209,39 @@ actor_losses = []
 entropies = []
 wins = []
 
+change_level_episode = []
+current_leve_wins = []
+
 
 for i in range(EPISODE):
     env.reset(seed=42)
+    player = "player_1" if random() > 0.5 else "player_2"
 
     np_ep_rewards = []
     np_ep_action_log_probs = []
     np_ep_value_preds = []
     np_ep_entropy = []
     np_ep_masks = []
+
+    if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
+        change_level_episode.append(i)
+        opponent.load(model)
+        current_leve_wins = []
+
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
 
-        learning_model_round = agent == "player_1"
+        learning_model_round = agent == player
         if termination or truncation:
             action = None
             if learning_model_round:
                 np_ep_rewards[len(np_ep_rewards) - 1] = reward
-                wins.append(reward)
+                if reward == 1:
+                    wins.append(reward)
+                    current_leve_wins.append(1)
+                else:
+                    wins.append(0)
+                    current_leve_wins.append(0)
         else:
             mask = observation["action_mask"]
             state = observation["observation"]
@@ -267,19 +285,21 @@ for i in range(EPISODE):
     entropies.append(ep_entropy.detach().mean().cpu().numpy())
 
 
-
-
-rolling_length = 20
+rolling_length = 100
 fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(12, 5))
-fig.suptitle( "Training plots for A2C in the TicTacToe environment")
+fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
-axs[0][0].set_title("Wins")
+axs[0][0].set_title("Status")
 wins_moving_average = (
-    np.convolve(np.array(wins), np.ones(rolling_length), mode="valid")
-    / rolling_length
+    np.convolve(np.array(wins), np.ones(rolling_length), mode="valid") / rolling_length
 )
 axs[0][0].plot(wins_moving_average)
+
+for i in change_level_episode:
+    axs[0][0].vlines(i, 0, 1)
+# axs[0][0].plot(deuces_moving_average)
+# axs[0][0].plot(losses_moving_average)
 axs[0][0].set_xlabel("Number of updates")
 
 # entropy
@@ -314,5 +334,34 @@ axs[1][1].plot(actor_losses_moving_average)
 axs[1][1].set_xlabel("Number of updates")
 
 plt.tight_layout()
-plt.show()
+plt.show(block = False)
+
+
+while True:
+    env_manual.reset(seed=42)
+    player = "player_1" if random() > 0.5 else "player_2"
+    for agent in env_manual.agent_iter():
+        observation, reward, termination, truncation, info = env_manual.last()
+
+        learning_model_round = agent == player
+        if termination or truncation:
+            action = None
+        else:
+            mask = observation["action_mask"]
+            state = observation["observation"]
+            if learning_model_round:
+                agent_model = model
+                mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+                actions, action_log_probs, state_values, entropy = (
+                    agent_model.select_action(x=state.flatten(), mask=mask_values)
+                )
+                action = actions.cpu().detach().numpy()
+            else:
+                print('Pick action')
+                action = input()
+                action = np.array(action, dtype=np.int16)
+
+        env_manual.step(action)
+
 env.close()
+env_manual.close()
