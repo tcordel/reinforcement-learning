@@ -207,7 +207,7 @@ opponent.load(model)
 critic_losses = []
 actor_losses = []
 entropies = []
-wins = []
+losses = []
 
 change_level_episode = []
 current_leve_wins = []
@@ -236,11 +236,10 @@ for i in range(EPISODE):
             action = None
             if learning_model_round:
                 np_ep_rewards[len(np_ep_rewards) - 1] = reward
+                losses.append(1 if reward == -1 else 0)
                 if reward == 1:
-                    wins.append(reward)
                     current_leve_wins.append(1)
                 else:
-                    wins.append(0)
                     current_leve_wins.append(0)
         else:
             mask = observation["action_mask"]
@@ -291,10 +290,10 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
 axs[0][0].set_title("Status")
-wins_moving_average = (
-    np.convolve(np.array(wins), np.ones(rolling_length), mode="valid") / rolling_length
+loss_moving_average = (
+    np.convolve(np.array(losses), np.ones(rolling_length), mode="valid") / rolling_length
 )
-axs[0][0].plot(wins_moving_average)
+axs[0][0].plot(loss_moving_average)
 
 for i in change_level_episode:
     axs[0][0].vlines(i, 0, 1)
