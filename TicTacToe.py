@@ -5,6 +5,7 @@ import torch.nn as nn
 from random import random
 from pettingzoo.classic import tictactoe_v3
 from torch import optim
+from torch.nn import functional as F
 
 
 class A2C(nn.Module):
@@ -79,7 +80,7 @@ class A2C(nn.Module):
 
     def select_action(
         self, x: np.ndarray, mask: torch.tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns a tuple of the chosen actions and the log-probs of those actions.
 
@@ -100,7 +101,7 @@ class A2C(nn.Module):
         actions = action_pd.sample()
         action_log_probs = action_pd.log_prob(actions)
         entropy = action_pd.entropy()
-        return actions, action_log_probs, state_values, entropy
+        return actions, action_log_probs, state_values, entropy, action_logits
 
     def get_losses(
         self,
@@ -178,7 +179,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 35000
+EPISODE = 5000
 CRITIC_LR = 0.0005
 ACTOR_LR = 0.001
 
@@ -213,9 +214,53 @@ change_level_episode = []
 current_leve_wins = []
 
 
+def mesure():
+    l_wins = 0
+    l_deuce = 0
+    l_loss = 0
+    for i in range(100):
+        env.reset(seed=42)
+        player = "player_1"
+
+        # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
+        #     change_level_episode.append(i)
+        #     opponent.load(model)
+        #     current_leve_wins = []
+        #
+        for agent in env.agent_iter():
+            observation, reward, termination, truncation, info = env.last()
+
+            learning_model_round = agent == player
+            if termination or truncation:
+                action = None
+                if learning_model_round:
+                    if reward == 1:
+                        l_wins += 1
+                    elif reward == 0:
+                        l_deuce += 1
+                    else:
+                        l_loss += 1
+            else:
+                with torch.no_grad():
+                    mask = observation["action_mask"]
+                    state = observation["observation"]
+                    agent_model = model if learning_model_round else opponent
+                    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+                    actions, action_log_probs, state_values, entropy, logits = (
+                        agent_model.select_action(x=state.flatten(), mask=mask_values)
+                    )
+                    probs = F.softmax(logits, dim=-1)
+                    action = np.argmax(probs.detach().numpy())
+
+            env.step(action)
+    return (l_wins, l_deuce, l_loss)
+
+i_win, i_deuce, i_loss = mesure()
+print(f"{i_win},{i_deuce},{i_loss}")
+
 for i in range(EPISODE):
     env.reset(seed=42)
-    player = "player_1" if random() > 0.5 else "player_2"
+    player = "player_1"
 
     np_ep_rewards = []
     np_ep_action_log_probs = []
@@ -223,11 +268,11 @@ for i in range(EPISODE):
     np_ep_entropy = []
     np_ep_masks = []
 
-    if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
-        change_level_episode.append(i)
-        opponent.load(model)
-        current_leve_wins = []
-
+    # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
+    #     change_level_episode.append(i)
+    #     opponent.load(model)
+    #     current_leve_wins = []
+    #
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
 
@@ -246,7 +291,7 @@ for i in range(EPISODE):
             state = observation["observation"]
             agent_model = model if learning_model_round else opponent
             mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-            actions, action_log_probs, state_values, entropy = (
+            actions, action_log_probs, state_values, entropy, logits = (
                 agent_model.select_action(x=state.flatten(), mask=mask_values)
             )
             action = actions.cpu().detach().numpy()
@@ -291,7 +336,8 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 # entropy
 axs[0][0].set_title("Status")
 loss_moving_average = (
-    np.convolve(np.array(losses), np.ones(rolling_length), mode="valid") / rolling_length
+    np.convolve(np.array(losses), np.ones(rolling_length), mode="valid")
+    / rolling_length
 )
 axs[0][0].plot(loss_moving_average)
 
@@ -335,6 +381,8 @@ axs[1][1].set_xlabel("Number of updates")
 plt.tight_layout()
 plt.show(block = False)
 
+i_win, i_deuce, i_loss = mesure()
+print(f"{i_win},{i_deuce},{i_loss}")
 
 while True:
     env_manual.reset(seed=42)
@@ -351,10 +399,11 @@ while True:
             if learning_model_round:
                 agent_model = model
                 mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                actions, action_log_probs, state_values, entropy = (
+                actions, action_log_probs, state_values, entropy, logits = (
                     agent_model.select_action(x=state.flatten(), mask=mask_values)
                 )
-                action = actions.cpu().detach().numpy()
+                probs = F.softmax(logits, dim=-1)
+                action = np.argmax(probs.detach().numpy())
             else:
                 print('Pick action')
                 action = input()
