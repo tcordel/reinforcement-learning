@@ -185,7 +185,7 @@ ACTOR_LR = 0.001
 
 GAMMA = 0.9
 LAM = 0  # hyperparameter for GAE
-ENT_COEF = 0  # coefficient for the entropy bonus (to encourage exploration)
+ENT_COEF = 0.1  # coefficient for the entropy bonus (to encourage exploration)
 
 model = A2C(
     n_features=18,
@@ -386,7 +386,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 
 while True:
     env_manual.reset(seed=42)
-    player = "player_1" if random() > 0.5 else "player_2"
+    player = "player_1"
     for agent in env_manual.agent_iter():
         observation, reward, termination, truncation, info = env_manual.last()
 
