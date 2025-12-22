@@ -30,17 +30,20 @@ class Memory:
 class ReplayMemory:
     def __init__(self, buffer_size: int):
         self.buffer_size = buffer_size
-        self.buffer = []
+        self.clear()
 
     def add(self, item: Memory):
         if len(self.buffer) == self.buffer_size:
             self.buffer.pop(0)
         self.buffer.append(item)
 
+    def clear(self):
+        self.buffer = []
+
 
     def sample(self, sample_size):
         # sampling
-        items = random.sample(self.buffer, sample_size)
+        items = self.buffer
         # divide each columns
         states = torch.stack([i.state for i in items], dim=0)
         masks = torch.stack([i.mask for i in items], dim=0)
@@ -180,17 +183,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 50000
-LR = 3e-4  # plus stable
+EPISODE = 2000
+LR = 1e-5  # plus stable
 
-GAMMA = 0.95  # ← clé
+GAMMA = 1  # ← clé
 
 epsilon = 1.0
-EPSILON_DECAY = 1.0 / 2000
+EPSILON_DECAY = 1.0 / 500
 EPSILON_FINAL = 0
 BATCH_SIZE = 64
 SAMPLING_SIZE = BATCH_SIZE * 30
-TARGET_UPDATE = 200
+TARGET_UPDATE = 2000
 
 model = DQN(
     n_features=18,
@@ -252,7 +255,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 for i in range(EPISODE):
     env.reset(seed=42)
     player = "player_1" if bool(random.getrandbits(1)) else "player_2"
-    # player = "player_1"
+    player = "player_1"
 
     items = {}
     # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
@@ -301,30 +304,32 @@ for i in range(EPISODE):
 
         env.step(action)
 
-    if memory.length() < 5000:
-        continue
+    # if memory.length() < 5000:
+    #     continue
 
-    losses = []
-    for j in range(30):
-        states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
-            BATCH_SIZE
-        )
-        loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
-        model.update_parameters(loss)
-        losses.append(np.mean(loss.detach().cpu().numpy()))
+    loss_cuml = None
+    states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
+        BATCH_SIZE
+    )
+    loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
+    model.update_parameters(loss)
+    if loss_cuml is None:
+        loss_cuml = loss.detach().cpu().numpy()
+    else:
+        loss_cuml = loss_cuml + loss.detach().cpu().numpy()
 
     # Update epsilon
     if epsilon - EPSILON_DECAY >= EPSILON_FINAL:
         epsilon -= EPSILON_DECAY
 
     # log the losses and entropy
-    learning_losses.append(np.mean(losses))
-    if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
-        break
+    learning_losses.append(loss_cuml)
+    # if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
+    #     break
 
-    if i % TARGET_UPDATE == 0:
-        model.update_target()
-        print(f"update_target ${i}")
+    # if i % TARGET_UPDATE == 0:
+    #     model.update_target()
+    #     print(f"update_target ${i}")
 
 
 rolling_length = 100
