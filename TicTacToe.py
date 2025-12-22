@@ -15,14 +15,16 @@ class Memory:
         action: int,
         mask: torch.Tensor,
         reward: int,
+        n_state: torch.Tensor,
+        n_mask: torch.Tensor,
         done: int,
     ):
         self.state = state
         self.action = action
         self.mask = mask
         self.reward = reward
-        self.n_state = torch.ones_like(state)
-        self.n_mask = torch.ones_like(mask)
+        self.n_state = n_state
+        self.n_mask = n_mask
         self.done = done
         pass
 
@@ -114,7 +116,9 @@ class DQN(nn.Module):
     def update_target(self):
         self.qt.load_state_dict(self.q.state_dict())
 
-    def select_action(self, x: torch.Tensor, mask: torch.Tensor, epsilon: float, learning: bool) -> int:
+    def select_action(
+        self, x: torch.Tensor, mask: torch.Tensor, epsilon: float, learning: bool
+    ) -> int:
         if np.random.random() > epsilon:
             if learning:
                 q_values = self.q(x)
@@ -144,8 +148,8 @@ class DQN(nn.Module):
         with torch.no_grad():
             # compute Q(s_{t+1})                               : size=[batch_size, 2]
             target_vals_for_all_actions = self.qt(next_states)
-            target_vals_for_all_actions_masked = target_vals_for_all_actions.masked_fill(
-                ~next_masks, -np.inf
+            target_vals_for_all_actions_masked = (
+                target_vals_for_all_actions.masked_fill(~next_masks, -np.inf)
             )
             # compute argmax_a Q(s_{t+1})                      : size=[batch_size]
             target_actions = torch.argmax(target_vals_for_all_actions_masked, 1)
@@ -191,7 +195,7 @@ GAMMA = 0.95  # ← clé
 
 epsilon = 1.0
 EPSILON_DECAY = 1.0 / 2000
-EPSILON_FINAL = 0.1
+EPSILON_FINAL = 0.2
 BATCH_SIZE = 64
 SAMPLING_SIZE = BATCH_SIZE * 30
 TARGET_UPDATE = 2000
@@ -240,7 +244,9 @@ def mesure():
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
                     x = torch.Tensor(state).to(device)
                     x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
-                    action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
+                    action = model.select_action(
+                        x=x, mask=mask_values, epsilon=0, learning=True
+                    )
 
             env.step(action)
     return (l_wins, l_deuce, l_loss)
@@ -248,6 +254,115 @@ def mesure():
 
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
+
+
+def idx_to_coord(a):
+    return a // 3, a % 3
+
+
+def coord_to_idx(i, j):
+    return i * 3 + j
+
+
+def rotate_coord_90(i, j):
+    return j, 2 - i
+
+
+def rotate_action(action, k):
+    i, j = idx_to_coord(action)
+    for _ in range(k):
+        i, j = rotate_coord_90(i, j)
+    return coord_to_idx(i, j)
+
+
+def mirror_coord(i, j):
+    return i, 2 - j
+
+
+def mirror_action(action):
+    i, j = idx_to_coord(action)
+    i, j = mirror_coord(i, j)
+    return coord_to_idx(i, j)
+
+
+def rotate_grid(x, k):
+    return torch.rot90(x, k, dims=(0, 1))
+
+
+def mirror_grid(x):
+    return torch.flip(x, dims=(1,))  # miroir horizontal
+
+
+def rotate_mask(mask, k):
+    return rotate_grid(mask.view(3, 3), k).flatten()
+
+
+def mirror_mask(mask):
+    return mirror_grid(mask.view(3, 3)).flatten()
+
+
+def augment_d4(memory: Memory) -> list[Memory]:
+    """
+    Retourne une liste de Memory
+    """
+    s0 = memory.state
+    mask = memory.mask
+    action = memory.action
+    reward = memory.reward
+    s1 = memory.n_state 
+    next_mask = memory.n_mask 
+    done = memory.done
+    memories = []
+
+    # vue canonique
+    s0 = s0.view(3,3)
+    s1 = s1.view(3,3)
+
+    for k in range(4):
+        # --- rotation ---
+        s_rot = rotate_grid(s0, k)
+        ns_rot = rotate_grid(s1, k)
+
+        m_rot = rotate_mask(mask, k)
+        nm_rot = rotate_mask(next_mask, k)
+
+        a_rot = rotate_action(action, k)
+
+        memories.append(
+            Memory(
+                state=s_rot.flatten().to(device),
+                action=a_rot,
+                mask=m_rot.to(device),
+                reward=reward,
+                n_state=ns_rot.flatten().to(device),
+                n_mask=nm_rot.to(device),
+                done=done,
+            )
+        )
+
+        # --- miroir + rotation ---
+        s_m = mirror_grid(s_rot)
+        ns_m = mirror_grid(ns_rot)
+
+        m_m = mirror_mask(m_rot)
+        nm_m = mirror_mask(nm_rot)
+
+        a_m = mirror_action(a_rot)
+
+        memories.append(
+            Memory(
+                state=s_m.flatten().to(device),
+                action=a_m,
+                mask=m_m.to(device),
+                reward=reward,
+                n_state=ns_m.flatten().to(device),
+                n_mask=nm_m.to(device),
+                done=done,
+            )
+        )
+
+    return memories
+
 
 for i in range(EPISODE):
     env.reset(seed=42)
@@ -268,7 +383,9 @@ for i in range(EPISODE):
             # items[agent].reward = 0.1 if reward == 0 else reward
             items[agent].reward = reward
             items[agent].done = 1
-            memory.add(items[agent])
+            item_aug = augment_d4(items[agent])
+            for item in range(len(item_aug)):
+                memory.add(item_aug[item])
             if player == "player_1":
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
@@ -278,10 +395,10 @@ for i in range(EPISODE):
             if agent in items:
                 memory.add(items[agent])
 
-            action = model.select_action(x=x, mask=mask_values, epsilon=epsilon, learning=True)
-            item = Memory(
-                state=x, action=action, mask=mask_values, reward=0, done=0
+            action = model.select_action(
+                x=x, mask=mask_values, epsilon=epsilon, learning=True
             )
+            item = Memory(state=x, action=action, mask=mask_values, reward=0, done=0,n_state=x, n_mask= mask_values)
             items[agent] = item
 
             env.step(action)
@@ -304,7 +421,9 @@ for i in range(EPISODE):
         states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
             BATCH_SIZE
         )
-        loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
+        loss = model.get_losses(
+            states, actions, rewards, n_states, n_masks, dones, GAMMA
+        )
         model.update_parameters(loss)
         if loss_cuml is None:
             loss_cuml = loss.detach().cpu().numpy()
@@ -333,16 +452,20 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 axs[0].set_title("Status")
 if len(first_player_losses) > 0:
     first_loss_moving_average = (
-        np.convolve(np.array(first_player_losses), np.ones(rolling_length), mode="valid")
+        np.convolve(
+            np.array(first_player_losses), np.ones(rolling_length), mode="valid"
+        )
         / rolling_length
     )
-    axs[0].plot(first_loss_moving_average, label='p1w')
+    axs[0].plot(first_loss_moving_average, label="p1w")
 if len(first_player_deuces) > 0:
     first_deuce_moving_average = (
-        np.convolve(np.array(first_player_deuces), np.ones(rolling_length), mode="valid")
+        np.convolve(
+            np.array(first_player_deuces), np.ones(rolling_length), mode="valid"
+        )
         / rolling_length
     )
-    axs[0].plot(first_deuce_moving_average, label='p1d')
+    axs[0].plot(first_deuce_moving_average, label="p1d")
 
 # for i in change_level_episode:
 #     axs[0][0].vlines(i, 0, 1)
@@ -385,7 +508,9 @@ while True:
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
                     x = torch.Tensor(state).to(device)
                     x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
-                    action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
+                    action = model.select_action(
+                        x=x, mask=mask_values, epsilon=0, learning=True
+                    )
             else:
                 print("Pick action")
                 action = input()
