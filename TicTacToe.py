@@ -30,7 +30,7 @@ class Memory:
 class ReplayMemory:
     def __init__(self, buffer_size: int):
         self.buffer_size = buffer_size
-        self.clear()
+        self.buffer = []
 
     def add(self, item: Memory):
         if len(self.buffer) == self.buffer_size:
@@ -38,12 +38,13 @@ class ReplayMemory:
         self.buffer.append(item)
 
     def clear(self):
-        self.buffer = []
-
+        a = ""
+        # self.buffer = []
 
     def sample(self, sample_size):
         # sampling
-        items = self.buffer
+        # items = self.buffer
+        items = random.sample(self.buffer, sample_size)
         # divide each columns
         states = torch.stack([i.state for i in items], dim=0)
         masks = torch.stack([i.mask for i in items], dim=0)
@@ -184,7 +185,7 @@ env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
 EPISODE = 5000
-LR = 1e-4  # plus stable
+LR = 1e-6  # plus stable
 
 GAMMA = 0.95  # ← clé
 
@@ -205,7 +206,10 @@ model = DQN(
 
 
 learning_losses = []
-losses = []
+first_player_losses = []
+first_player_deuces = []
+second_player_losses = []
+second_player_deuces = []
 
 change_level_episode = []
 current_leve_wins = []
@@ -257,7 +261,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 for i in range(EPISODE):
     env.reset(seed=42)
     player = "player_1" if bool(random.getrandbits(1)) else "player_2"
-    # player = "player_1"
+    # player = "player_2"
 
     items = {}
     # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
@@ -287,10 +291,15 @@ for i in range(EPISODE):
             action = None
             if learning_model_round:
                 # items[agent].reward = 0.1 if reward == 0 else reward
-                items[agent].reward = reward
+                items[agent].reward = 0.2 if reward == 0 else reward
                 items[agent].done = 1
                 memory.add(items[agent])
-                losses.append(1 if reward == -1 else 0)
+                if player == "player_1":
+                    first_player_losses.append(1 if reward == -1 else 0)
+                    first_player_deuces.append(1 if reward == 0 else 0)
+                else:
+                    second_player_losses.append(1 if reward == -1 else 0)
+                    second_player_deuces.append(1 if reward == 0 else 0)
                 if reward == 1:
                     current_leve_wins.append(1)
                 else:
@@ -308,19 +317,20 @@ for i in range(EPISODE):
 
         env.step(action)
 
-    # if memory.length() < 5000:
-    #     continue
+    if memory.length() < 5000:
+        continue
 
     loss_cuml = None
-    states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
-        BATCH_SIZE
-    )
-    loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
-    model.update_parameters(loss)
-    if loss_cuml is None:
-        loss_cuml = loss.detach().cpu().numpy()
-    else:
-        loss_cuml = loss_cuml + loss.detach().cpu().numpy()
+    for t in range(10):
+        states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
+            BATCH_SIZE
+        )
+        loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
+        model.update_parameters(loss)
+        if loss_cuml is None:
+            loss_cuml = loss.detach().cpu().numpy()
+        else:
+            loss_cuml = loss_cuml + loss.detach().cpu().numpy()
 
     # Update epsilon
     if epsilon - EPSILON_DECAY >= EPSILON_FINAL:
@@ -342,12 +352,31 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
 axs[0].set_title("Status")
-loss_moving_average = (
-    np.convolve(np.array(losses), np.ones(rolling_length), mode="valid")
-    / rolling_length
-)
-axs[0].plot(loss_moving_average)
+if len(first_player_losses) > 0:
+    first_loss_moving_average = (
+        np.convolve(np.array(first_player_losses), np.ones(rolling_length), mode="valid")
+        / rolling_length
+    )
+    axs[0].plot(first_loss_moving_average)
+if len(first_player_deuces) > 0:
+    first_deuce_moving_average = (
+        np.convolve(np.array(first_player_deuces), np.ones(rolling_length), mode="valid")
+        / rolling_length
+    )
+    axs[0].plot(first_deuce_moving_average)
 
+if len(second_player_losses) > 0:
+    second_loss_moving_average = (
+        np.convolve(np.array(second_player_losses), np.ones(rolling_length), mode="valid")
+        / rolling_length
+    )
+    axs[0].plot(second_loss_moving_average)
+if len(second_player_deuces) > 0:
+    second_deuce_moving_average = (
+        np.convolve(np.array(second_player_deuces), np.ones(rolling_length), mode="valid")
+        / rolling_length
+    )
+    axs[0].plot(second_deuce_moving_average)
 # for i in change_level_episode:
 #     axs[0][0].vlines(i, 0, 1)
 # axs[0][0].plot(deuces_moving_average)
