@@ -184,14 +184,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 5000
-LR = 1e-6  # plus stable
+EPISODE = 10000
+LR = 1e-5  # plus stable
 
 GAMMA = 0.95  # ← clé
 
 epsilon = 1.0
-EPSILON_DECAY = 1.0 / 1000
-EPSILON_FINAL = 0
+EPSILON_DECAY = 1.0 / 2000
+EPSILON_FINAL = 0.1
 BATCH_SIZE = 64
 SAMPLING_SIZE = BATCH_SIZE * 30
 TARGET_UPDATE = 2000
@@ -208,8 +208,6 @@ model = DQN(
 learning_losses = []
 first_player_losses = []
 first_player_deuces = []
-second_player_losses = []
-second_player_deuces = []
 
 change_level_episode = []
 
@@ -274,9 +272,6 @@ for i in range(EPISODE):
             if player == "player_1":
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
-            else:
-                second_player_losses.append(1 if reward == -1 else 0)
-                second_player_deuces.append(1 if reward == 0 else 0)
 
             env.step(action)
         else:
@@ -325,9 +320,9 @@ for i in range(EPISODE):
     # if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
     #     break
 
-    # if i % TARGET_UPDATE == 0:
-    #     model.update_target()
-    #     print(f"update_target ${i}")
+    if i % TARGET_UPDATE == 0:
+        # model.update_target()
+        print(f"update_target ${i}")
 
 
 rolling_length = 100
@@ -341,32 +336,20 @@ if len(first_player_losses) > 0:
         np.convolve(np.array(first_player_losses), np.ones(rolling_length), mode="valid")
         / rolling_length
     )
-    axs[0].plot(first_loss_moving_average)
+    axs[0].plot(first_loss_moving_average, label='p1w')
 if len(first_player_deuces) > 0:
     first_deuce_moving_average = (
         np.convolve(np.array(first_player_deuces), np.ones(rolling_length), mode="valid")
         / rolling_length
     )
-    axs[0].plot(first_deuce_moving_average)
+    axs[0].plot(first_deuce_moving_average, label='p1d')
 
-if len(second_player_losses) > 0:
-    second_loss_moving_average = (
-        np.convolve(np.array(second_player_losses), np.ones(rolling_length), mode="valid")
-        / rolling_length
-    )
-    axs[0].plot(second_loss_moving_average)
-if len(second_player_deuces) > 0:
-    second_deuce_moving_average = (
-        np.convolve(np.array(second_player_deuces), np.ones(rolling_length), mode="valid")
-        / rolling_length
-    )
-    axs[0].plot(second_deuce_moving_average)
 # for i in change_level_episode:
 #     axs[0][0].vlines(i, 0, 1)
 # axs[0][0].plot(deuces_moving_average)
 # axs[0][0].plot(losses_moving_average)
 axs[0].set_xlabel("Number of updates")
-
+axs[0].legend()
 #  loss
 axs[1].set_title("Loss")
 critic_losses_moving_average = (
