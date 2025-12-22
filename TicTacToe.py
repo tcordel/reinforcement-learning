@@ -183,20 +183,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 2000
-LR = 1e-5  # plus stable
+EPISODE = 5000
+LR = 1e-4  # plus stable
 
-GAMMA = 1  # ← clé
+GAMMA = 0.95  # ← clé
 
 epsilon = 1.0
-EPSILON_DECAY = 1.0 / 500
+EPSILON_DECAY = 1.0 / 1000
 EPSILON_FINAL = 0
 BATCH_SIZE = 64
 SAMPLING_SIZE = BATCH_SIZE * 30
 TARGET_UPDATE = 2000
 
 model = DQN(
-    n_features=18,
+    n_features=19,
     n_actions=9,
     device=device,
     lr=LR,
@@ -243,6 +243,8 @@ def mesure():
                     state = observation["observation"]
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
                     x = torch.Tensor(state.flatten()).to(device)
+                    role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
+                    x = torch.cat([x, role])
                     action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
 
             env.step(action)
@@ -255,7 +257,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 for i in range(EPISODE):
     env.reset(seed=42)
     player = "player_1" if bool(random.getrandbits(1)) else "player_2"
-    player = "player_1"
+    # player = "player_1"
 
     items = {}
     # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
@@ -273,6 +275,8 @@ for i in range(EPISODE):
             x[:, :, 0].flatten(),
             x[:, :, 1].flatten() * -1
         ])
+        role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
+        x = torch.cat([x, role])
 
         if agent in items:
             items[agent].n_state = x
@@ -384,6 +388,8 @@ while True:
                 with torch.no_grad():
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
                     x = torch.Tensor(state.flatten()).to(device)
+                    role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
+                    x = torch.cat([x, role])
                     action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
             else:
                 print("Pick action")
