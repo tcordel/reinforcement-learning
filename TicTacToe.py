@@ -197,7 +197,7 @@ SAMPLING_SIZE = BATCH_SIZE * 30
 TARGET_UPDATE = 2000
 
 model = DQN(
-    n_features=19,
+    n_features=9,
     n_actions=9,
     device=device,
     lr=LR,
@@ -212,7 +212,6 @@ second_player_losses = []
 second_player_deuces = []
 
 change_level_episode = []
-current_leve_wins = []
 
 
 def mesure():
@@ -223,11 +222,6 @@ def mesure():
         env.reset(seed=42)
         player = "player_1"
 
-        # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
-        #     change_level_episode.append(i)
-        #     opponent.load(model)
-        #     current_leve_wins = []
-        #
         for agent in env.agent_iter():
             observation, reward, termination, truncation, info = env.last()
 
@@ -246,9 +240,8 @@ def mesure():
                     mask = observation["action_mask"]
                     state = observation["observation"]
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                    x = torch.Tensor(state.flatten()).to(device)
-                    role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
-                    x = torch.cat([x, role])
+                    x = torch.Tensor(state).to(device)
+                    x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
                     action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
 
             env.step(action)
@@ -264,58 +257,49 @@ for i in range(EPISODE):
     # player = "player_2"
 
     items = {}
-    # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
-    #     change_level_episode.append(i)
-    #     opponent.load(model)
-    #     current_leve_wins = []
-    #
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
         state = observation["observation"]
         mask = observation["action_mask"]
         mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
         x = torch.Tensor(state).to(device)
-        x = torch.cat([
-            x[:, :, 0].flatten(),
-            x[:, :, 1].flatten() * -1
-        ])
-        role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
-        x = torch.cat([x, role])
+        x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
 
-        if agent in items:
-            items[agent].n_state = x
-            items[agent].n_mask = mask_values
-
-        learning_model_round = agent == player
         if termination or truncation:
             action = None
-            if learning_model_round:
-                # items[agent].reward = 0.1 if reward == 0 else reward
-                items[agent].reward = 0.2 if reward == 0 else reward
-                items[agent].done = 1
-                memory.add(items[agent])
-                if player == "player_1":
-                    first_player_losses.append(1 if reward == -1 else 0)
-                    first_player_deuces.append(1 if reward == 0 else 0)
-                else:
-                    second_player_losses.append(1 if reward == -1 else 0)
-                    second_player_deuces.append(1 if reward == 0 else 0)
-                if reward == 1:
-                    current_leve_wins.append(1)
-                else:
-                    current_leve_wins.append(0)
+            # items[agent].reward = 0.1 if reward == 0 else reward
+            items[agent].reward = reward
+            items[agent].done = 1
+            memory.add(items[agent])
+            if player == "player_1":
+                first_player_losses.append(1 if reward == -1 else 0)
+                first_player_deuces.append(1 if reward == 0 else 0)
+            else:
+                second_player_losses.append(1 if reward == -1 else 0)
+                second_player_deuces.append(1 if reward == 0 else 0)
+
+            env.step(action)
         else:
-            if learning_model_round and agent in items:
+            if agent in items:
                 memory.add(items[agent])
 
-            action = model.select_action(x=x, mask=mask_values, epsilon=epsilon, learning=learning_model_round)
-            if learning_model_round:
-                item = Memory(
-                    state=x, action=action, mask=mask_values, reward=0, done=0
-                )
-                items[agent] = item
+            action = model.select_action(x=x, mask=mask_values, epsilon=epsilon, learning=True)
+            item = Memory(
+                state=x, action=action, mask=mask_values, reward=0, done=0
+            )
+            items[agent] = item
 
-        env.step(action)
+            env.step(action)
+            observation, reward, termination, truncation, info = env.last()
+            state = observation["observation"]
+            mask = observation["action_mask"]
+            mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+            x = torch.Tensor(state).to(device)
+            x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
+
+            if agent in items:
+                items[agent].n_state = x
+                items[agent].n_mask = mask_values
 
     if memory.length() < 5000:
         continue
@@ -416,9 +400,8 @@ while True:
             if learning_model_round:
                 with torch.no_grad():
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                    x = torch.Tensor(state.flatten()).to(device)
-                    role = torch.tensor([1.0]) if agent == "player_1" else torch.tensor([-1.0])
-                    x = torch.cat([x, role])
+                    x = torch.Tensor(state).to(device)
+                    x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
                     action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
             else:
                 print("Pick action")
