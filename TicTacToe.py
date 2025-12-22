@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import random
 from pettingzoo.classic import tictactoe_v3
-from torch import optim
+from torch import cpu, optim
 from torch.nn import functional as F
 
 
@@ -37,13 +37,10 @@ class ReplayMemory:
             self.buffer.pop(0)
         self.buffer.append(item)
 
-    def clear(self):
-        self.buffer = []
 
     def sample(self, sample_size):
         # sampling
-        # items = random.sample(self.buffer, sample_size)
-        items = self.buffer
+        items = random.sample(self.buffer, sample_size)
         # divide each columns
         states = torch.stack([i.state for i in items], dim=0)
         masks = torch.stack([i.mask for i in items], dim=0)
@@ -63,7 +60,7 @@ class ReplayMemory:
         return len(self.buffer)
 
 
-memory = ReplayMemory(buffer_size=500)
+memory = ReplayMemory(buffer_size=10000)
 
 
 class DQN(nn.Module):
@@ -143,11 +140,11 @@ class DQN(nn.Module):
         with torch.no_grad():
             # compute Q(s_{t+1})                               : size=[batch_size, 2]
             target_vals_for_all_actions = self.qt(next_states)
-            target_vals_for_all_actions = target_vals_for_all_actions.masked_fill(
+            target_vals_for_all_actions_masked = target_vals_for_all_actions.masked_fill(
                 ~next_masks, -np.inf
             )
             # compute argmax_a Q(s_{t+1})                      : size=[batch_size]
-            target_actions = torch.argmax(target_vals_for_all_actions, 1)
+            target_actions = torch.argmax(target_vals_for_all_actions_masked, 1)
 
             # compute max Q(s_{t+1})                           : size=[batch_size]
             target_actions_one_hot = F.one_hot(target_actions, self.n_actions).float()
@@ -183,16 +180,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 5000
-LR = 3e-3  # plus stable
+EPISODE = 50000
+LR = 3e-4  # plus stable
 
 GAMMA = 0.95  # ← clé
 
 epsilon = 1.0
 EPSILON_DECAY = 1.0 / 2000
 EPSILON_FINAL = 0
-BATCH_SIZE = 30
-TARGET_UPDATE = 100
+BATCH_SIZE = 64
+SAMPLING_SIZE = BATCH_SIZE * 30
+TARGET_UPDATE = 200
 
 model = DQN(
     n_features=18,
@@ -253,9 +251,8 @@ print(f"{i_win},{i_deuce},{i_loss}")
 
 for i in range(EPISODE):
     env.reset(seed=42)
-    # player = "player_1" if bool(random.getrandbits(1)) else "player_2"
-    player = "player_1"
-    memory.clear()
+    player = "player_1" if bool(random.getrandbits(1)) else "player_2"
+    # player = "player_1"
 
     items = {}
     # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
@@ -276,7 +273,7 @@ for i in range(EPISODE):
 
         if agent in items:
             items[agent].n_state = x
-            items[agent].n_masks = mask_values
+            items[agent].n_mask = mask_values
 
         learning_model_round = agent == player
         if termination or truncation:
@@ -304,36 +301,29 @@ for i in range(EPISODE):
 
         env.step(action)
 
-    # if memory.length() < 400:
-    #     continue
+    if memory.length() < 5000:
+        continue
 
-    states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
-        BATCH_SIZE
-    )
-    # states = torch.reshape(states, (-1, BATCH_SIZE, 18))
-    # masks = torch.reshape(masks, (-1, BATCH_SIZE, 9))
-    # actions = torch.reshape(actions, (-1, BATCH_SIZE))
-    # rewards = torch.reshape(rewards, (-1, BATCH_SIZE))
-    # n_states = torch.reshape(n_states, (-1, BATCH_SIZE, 18))
-    # n_masks = torch.reshape(n_masks, (-1, BATCH_SIZE, 9))
-    # dones = torch.reshape(dones, (-1, BATCH_SIZE))
-
-    # size = actions.size(dim=0)
-    # for j in range(size):
-    loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
-    model.update_parameters(loss)
+    losses = []
+    for j in range(30):
+        states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
+            BATCH_SIZE
+        )
+        loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
+        model.update_parameters(loss)
+        losses.append(np.mean(loss.detach().cpu().numpy()))
 
     # Update epsilon
     if epsilon - EPSILON_DECAY >= EPSILON_FINAL:
         epsilon -= EPSILON_DECAY
 
     # log the losses and entropy
-    learning_losses.append(loss.detach().cpu().numpy())
+    learning_losses.append(np.mean(losses))
     if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
         break
 
     if i % TARGET_UPDATE == 0:
-        # model.update_target()
+        model.update_target()
         print(f"update_target ${i}")
 
 
