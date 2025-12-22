@@ -171,7 +171,7 @@ for _ in range(15000):
         continue
 
     # Optimize Q-network with a batch from replay memory
-    states, actions, rewards, n_states, dones = memory.sample(sampling_size)
+    states, masks, actions, rewards, n_states, dones = memory.sample(sampling_size)
     states = torch.reshape(states, (-1, batch_size, 4))
     actions = torch.reshape(actions, (-1, batch_size))
     rewards = torch.reshape(rewards, (-1, batch_size))

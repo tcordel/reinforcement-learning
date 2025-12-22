@@ -2,13 +2,71 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from random import random
+import random
 from pettingzoo.classic import tictactoe_v3
 from torch import optim
 from torch.nn import functional as F
 
 
-class A2C(nn.Module):
+class Memory:
+    def __init__(
+        self,
+        state: torch.Tensor,
+        action: int,
+        mask: torch.Tensor,
+        reward: int,
+        done: int,
+    ):
+        self.state = state
+        self.action = action
+        self.mask = mask
+        self.reward = reward
+        self.n_state = torch.ones_like(state)
+        self.n_mask = torch.ones_like(mask)
+        self.done = done
+        pass
+
+
+class ReplayMemory:
+    def __init__(self, buffer_size: int):
+        self.buffer_size = buffer_size
+        self.buffer = []
+
+    def add(self, item: Memory):
+        if len(self.buffer) == self.buffer_size:
+            self.buffer.pop(0)
+        self.buffer.append(item)
+
+    def clear(self):
+        self.buffer = []
+
+    def sample(self, sample_size):
+        # sampling
+        # items = random.sample(self.buffer, sample_size)
+        items = self.buffer
+        # divide each columns
+        states = torch.stack([i.state for i in items], dim=0)
+        masks = torch.stack([i.mask for i in items], dim=0)
+        n_states = torch.stack([i.n_state for i in items], dim=0)
+        n_masks = torch.stack([i.n_mask for i in items], dim=0)
+        actions = [i.action for i in items]
+        rewards = [i.reward for i in items]
+        dones = [i.done for i in items]
+        # convert to tensor
+        actions = torch.tensor(actions, dtype=torch.int64).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(device)
+        dones = torch.tensor(dones, dtype=torch.float).to(device)
+        # return result
+        return states, masks, actions, rewards, n_states, n_masks, dones
+
+    def length(self):
+        return len(self.buffer)
+
+
+memory = ReplayMemory(buffer_size=500)
+
+
+class DQN(nn.Module):
     """
     (Synchronous) Advantage Actor-Critic agent class
 
@@ -27,22 +85,13 @@ class A2C(nn.Module):
         n_features: int,
         n_actions: int,
         device: torch.device,
-        critic_lr: float,
-        actor_lr: float,
+        lr: float,
         n_envs: int,
     ) -> None:
-        """Initializes the actor and critic networks and their respective optimizers."""
         super().__init__()
         self.device = device
         self.n_envs = n_envs
-
-        critic_layers = [
-            nn.Linear(n_features, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),  # estimate V(s)
-        ]
+        self.n_actions = n_actions
 
         actor_layers = [
             nn.Linear(n_features, 32),
@@ -55,121 +104,76 @@ class A2C(nn.Module):
         ]
 
         # define actor and critic networks
-        self.critic = nn.Sequential(*critic_layers).to(self.device)
-        self.actor = nn.Sequential(*actor_layers).to(self.device)
+        self.q = nn.Sequential(*actor_layers).to(self.device)
+        self.qt = nn.Sequential(*actor_layers).to(self.device)
 
-        # define optimizers for actor and critic
-        self.critic_optim = optim.Adam(self.critic.parameters(), lr=critic_lr)
-        self.actor_optim = optim.RMSprop(self.actor.parameters(), lr=actor_lr)
+        self.optim = optim.Adam(self.q.parameters(), lr=lr)
+        self.update_target()
 
-    def forward(self, x: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the networks.
+    def update_target(self):
+        self.qt.load_state_dict(self.q.state_dict())
 
-        Args:
-            x: A batched vector of states.
-
-        Returns:
-            state_values: A tensor with the state values, with shape [n_envs,].
-            action_logits_vec: A tensor with the action logits, with shape [n_envs, n_actions].
-        """
-        x = torch.Tensor(x).to(self.device)
-        state_values = self.critic(x)  # shape: [n_envs,]
-        action_logits_vec = self.actor(x)  # shape: [n_envs, n_actions]
-        return (state_values, action_logits_vec)
-
-    def select_action(
-        self, x: np.ndarray, mask: torch.tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns a tuple of the chosen actions and the log-probs of those actions.
-
-        Args:
-            x: A batched vector of states.
-            masks: A batched vector of masks for current state
-
-        Returns:
-            actions: A tensor with the actions, with shape [n_steps_per_update, n_envs].
-            action_log_probs: A tensor with the log-probs of the actions, with shape [n_steps_per_update, n_envs].
-            state_values: A tensor with the state values, with shape [n_steps_per_update, n_envs].
-        """
-        state_values, action_logits = self.forward(x)
-        action_logits = action_logits.masked_fill(~mask, -np.inf)
-        action_pd = torch.distributions.Categorical(
-            logits=action_logits
-        )  # implicitly uses softmax
-        actions = action_pd.sample()
-        action_log_probs = action_pd.log_prob(actions)
-        entropy = action_pd.entropy()
-        return actions, action_log_probs, state_values, entropy, action_logits
+    def select_action(self, x: torch.Tensor, mask: torch.Tensor, epsilon: float, learning: bool) -> int:
+        if np.random.random() > epsilon:
+            if learning:
+                q_values = self.q(x)
+            else:
+                q_values = self.qt(x)
+            q_values = q_values.masked_fill(~mask, -np.inf)
+            action = torch.argmax(q_values)
+            action = action.unsqueeze(dim=0)
+            action = action.tolist()[0]
+        else:
+            action = np.random.choice(
+                self.n_actions,
+                p=(mask.float().tolist() / np.sum(mask.float().tolist())),
+            )
+        return action
 
     def get_losses(
         self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
         rewards: torch.Tensor,
-        action_log_probs: torch.Tensor,
-        value_preds: torch.Tensor,
-        entropy: torch.Tensor,
-        masks: torch.Tensor,
+        next_states: torch.Tensor,
+        next_masks: torch.Tensor,
+        dones: torch.Tensor,
         gamma: float,
-        lam: float,
-        ent_coef: float,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Computes the loss of a minibatch (transitions collected in one sampling phase) for actor and critic
-        using Generalized Advantage Estimation (GAE) to compute the advantages (https://arxiv.org/abs/1506.02438).
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            # compute Q(s_{t+1})                               : size=[batch_size, 2]
+            target_vals_for_all_actions = self.qt(next_states)
+            target_vals_for_all_actions = target_vals_for_all_actions.masked_fill(
+                ~next_masks, -np.inf
+            )
+            # compute argmax_a Q(s_{t+1})                      : size=[batch_size]
+            target_actions = torch.argmax(target_vals_for_all_actions, 1)
 
-        Args:
-            rewards: A tensor with the rewards for each time step in the episode, with shape [n_steps_per_update, n_envs].
-            action_log_probs: A tensor with the log-probs of the actions taken at each time step in the episode, with shape [n_steps_per_update, n_envs].
-            value_preds: A tensor with the state value predictions for each time step in the episode, with shape [n_steps_per_update, n_envs].
-            masks: A tensor with the masks for each time step in the episode, with shape [n_steps_per_update, n_envs].
-            gamma: The discount factor.
-            lam: The GAE hyperparameter. (lam=1 corresponds to Monte-Carlo sampling with high variance and no bias,
-                                          and lam=0 corresponds to normal TD-Learning that has a low variance but is biased
-                                          because the estimates are generated by a Neural Net).
-            device: The device to run the computations on (e.g. CPU or GPU).
+            # compute max Q(s_{t+1})                           : size=[batch_size]
+            target_actions_one_hot = F.one_hot(target_actions, self.n_actions).float()
+            target_vals = torch.sum(
+                target_vals_for_all_actions * target_actions_one_hot, 1
+            )
+            # compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batch_size]
+            target_vals_masked = (1.0 - dones) * target_vals
+            q_vals1 = rewards + gamma * target_vals_masked
 
-        Returns:
-            critic_loss: The critic loss for the minibatch.
-            actor_loss: The actor loss for the minibatch.
-        """
-        T = len(rewards)
-        returns = torch.zeros_like(rewards)
-        R = 0
-        for t in reversed(range(T)):
-            R = rewards[t] + gamma * masks[t] * R
-            returns[t] = R
-        advantages = returns - value_preds
-        advantages_actor = torch.clamp(advantages, -1.0, 1.0)
-        critic_loss = (returns - value_preds).pow(2).mean()
-        actor_loss = (
-            -(advantages_actor.detach() * action_log_probs).mean()
-            - ent_coef * entropy.mean()
-        )
-        return (critic_loss, actor_loss)
+        #
+        # Compute q-value
+        #
+        actions_one_hot = F.one_hot(actions, self.n_actions).float()
+        q_vals2 = torch.sum(self.q(states) * actions_one_hot, 1)
 
-    def update_parameters(
-        self, critic_loss: torch.Tensor, actor_loss: torch.Tensor
-    ) -> None:
-        """
-        Updates the parameters of the actor and critic networks.
+        #
+        # Get MSE loss and optimize
+        #
+        loss = F.mse_loss(q_vals1.detach(), q_vals2, reduction="mean")
+        return loss
 
-        Args:
-            critic_loss: The critic loss.
-            actor_loss: The actor loss.
-        """
-        self.critic_optim.zero_grad()
-        critic_loss.backward()
-        self.critic_optim.step()
-
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        self.actor_optim.step()
-
-    def load(self, other):
-        self.critic.load_state_dict(other.critic.state_dict())
-        self.actor.load_state_dict(other.actor.state_dict())
+    def update_parameters(self, loss: torch.Tensor) -> None:
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
 
 
 if torch.cuda.is_available():
@@ -180,34 +184,26 @@ env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
 EPISODE = 5000
-CRITIC_LR = 0.0005
-ACTOR_LR = 0.001
+LR = 3e-3  # plus stable
 
-GAMMA = 0.9
-LAM = 0  # hyperparameter for GAE
-ENT_COEF = 0.1  # coefficient for the entropy bonus (to encourage exploration)
+GAMMA = 0.95  # ← clé
 
-model = A2C(
+epsilon = 1.0
+EPSILON_DECAY = 1.0 / 2000
+EPSILON_FINAL = 0
+BATCH_SIZE = 30
+TARGET_UPDATE = 100
+
+model = DQN(
     n_features=18,
     n_actions=9,
     device=device,
-    critic_lr=CRITIC_LR,
-    actor_lr=ACTOR_LR,
+    lr=LR,
     n_envs=1,
 )
-opponent = A2C(
-    n_features=18,
-    n_actions=9,
-    device=device,
-    critic_lr=CRITIC_LR,
-    actor_lr=ACTOR_LR,
-    n_envs=1,
-)
-opponent.load(model)
 
-critic_losses = []
-actor_losses = []
-entropies = []
+
+learning_losses = []
 losses = []
 
 change_level_episode = []
@@ -244,30 +240,24 @@ def mesure():
                 with torch.no_grad():
                     mask = observation["action_mask"]
                     state = observation["observation"]
-                    agent_model = model if learning_model_round else opponent
                     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                    actions, action_log_probs, state_values, entropy, logits = (
-                        agent_model.select_action(x=state.flatten(), mask=mask_values)
-                    )
-                    probs = F.softmax(logits, dim=-1)
-                    action = np.argmax(probs.detach().numpy())
+                    x = torch.Tensor(state.flatten()).to(device)
+                    action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
 
             env.step(action)
     return (l_wins, l_deuce, l_loss)
+
 
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
 
 for i in range(EPISODE):
     env.reset(seed=42)
+    # player = "player_1" if bool(random.getrandbits(1)) else "player_2"
     player = "player_1"
+    memory.clear()
 
-    np_ep_rewards = []
-    np_ep_action_log_probs = []
-    np_ep_value_preds = []
-    np_ep_entropy = []
-    np_ep_masks = []
-
+    items = {}
     # if len(current_leve_wins) >= 50 and np.mean(current_leve_wins[-50:]) > 0.65:
     #     change_level_episode.append(i)
     #     opponent.load(model)
@@ -275,111 +265,110 @@ for i in range(EPISODE):
     #
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
+        state = observation["observation"]
+        mask = observation["action_mask"]
+        mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+        x = torch.Tensor(state).to(device)
+        x = torch.cat([
+            x[:, :, 0].flatten(),
+            x[:, :, 1].flatten() * -1
+        ])
+
+        if agent in items:
+            items[agent].n_state = x
+            items[agent].n_masks = mask_values
 
         learning_model_round = agent == player
         if termination or truncation:
             action = None
             if learning_model_round:
-                np_ep_rewards[len(np_ep_rewards) - 1] = reward
+                # items[agent].reward = 0.1 if reward == 0 else reward
+                items[agent].reward = reward
+                items[agent].done = 1
+                memory.add(items[agent])
                 losses.append(1 if reward == -1 else 0)
                 if reward == 1:
                     current_leve_wins.append(1)
                 else:
                     current_leve_wins.append(0)
         else:
-            mask = observation["action_mask"]
-            state = observation["observation"]
-            agent_model = model if learning_model_round else opponent
-            mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-            actions, action_log_probs, state_values, entropy, logits = (
-                agent_model.select_action(x=state.flatten(), mask=mask_values)
-            )
-            action = actions.cpu().detach().numpy()
+            if learning_model_round and agent in items:
+                memory.add(items[agent])
+
+            action = model.select_action(x=x, mask=mask_values, epsilon=epsilon, learning=learning_model_round)
             if learning_model_round:
-                np_ep_rewards.append(0)
-                np_ep_action_log_probs.append(action_log_probs)
-                np_ep_value_preds.append(state_values)
-                np_ep_masks.append(1)
-                np_ep_entropy.append(entropy)
+                item = Memory(
+                    state=x, action=action, mask=mask_values, reward=0, done=0
+                )
+                items[agent] = item
 
         env.step(action)
 
-    ep_rewards = torch.tensor(data=np_ep_rewards, dtype=torch.int16, device=device)
-    ep_action_log_probs = torch.stack(np_ep_action_log_probs, dim=0)
-    ep_value_preds = torch.stack(np_ep_value_preds, dim=0)
-    ep_entropy = torch.stack(np_ep_entropy, dim=0)
-    ep_masks = torch.tensor(data=np_ep_masks, dtype=torch.int16, device=device)
-    critic_loss, actor_loss = model.get_losses(
-        ep_rewards,
-        ep_action_log_probs,
-        ep_value_preds,
-        ep_entropy,
-        ep_masks,
-        GAMMA,
-        LAM,
-        ENT_COEF,
-        device,
-    )
+    # if memory.length() < 400:
+    #     continue
 
-    model.update_parameters(critic_loss, actor_loss)
+    states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
+        BATCH_SIZE
+    )
+    # states = torch.reshape(states, (-1, BATCH_SIZE, 18))
+    # masks = torch.reshape(masks, (-1, BATCH_SIZE, 9))
+    # actions = torch.reshape(actions, (-1, BATCH_SIZE))
+    # rewards = torch.reshape(rewards, (-1, BATCH_SIZE))
+    # n_states = torch.reshape(n_states, (-1, BATCH_SIZE, 18))
+    # n_masks = torch.reshape(n_masks, (-1, BATCH_SIZE, 9))
+    # dones = torch.reshape(dones, (-1, BATCH_SIZE))
+
+    # size = actions.size(dim=0)
+    # for j in range(size):
+    loss = model.get_losses(states, actions, rewards, n_states, n_masks, dones, GAMMA)
+    model.update_parameters(loss)
+
+    # Update epsilon
+    if epsilon - EPSILON_DECAY >= EPSILON_FINAL:
+        epsilon -= EPSILON_DECAY
 
     # log the losses and entropy
-    critic_losses.append(critic_loss.detach().cpu().numpy())
-    actor_losses.append(actor_loss.detach().cpu().numpy())
-    entropies.append(ep_entropy.detach().mean().cpu().numpy())
+    learning_losses.append(loss.detach().cpu().numpy())
+    if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
+        break
+
+    if i % TARGET_UPDATE == 0:
+        # model.update_target()
+        print(f"update_target ${i}")
 
 
 rolling_length = 100
-fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(12, 5))
+fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(12, 5))
 fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
-axs[0][0].set_title("Status")
+axs[0].set_title("Status")
 loss_moving_average = (
     np.convolve(np.array(losses), np.ones(rolling_length), mode="valid")
     / rolling_length
 )
-axs[0][0].plot(loss_moving_average)
+axs[0].plot(loss_moving_average)
 
-for i in change_level_episode:
-    axs[0][0].vlines(i, 0, 1)
+# for i in change_level_episode:
+#     axs[0][0].vlines(i, 0, 1)
 # axs[0][0].plot(deuces_moving_average)
 # axs[0][0].plot(losses_moving_average)
-axs[0][0].set_xlabel("Number of updates")
+axs[0].set_xlabel("Number of updates")
 
-# entropy
-axs[1][0].set_title("Entropy")
-entropy_moving_average = (
-    np.convolve(np.array(entropies), np.ones(rolling_length), mode="valid")
-    / rolling_length
-)
-axs[1][0].plot(entropy_moving_average)
-axs[1][0].set_xlabel("Number of updates")
-
-
-# critic loss
-axs[0][1].set_title("Critic Loss")
+#  loss
+axs[1].set_title("Loss")
 critic_losses_moving_average = (
     np.convolve(
-        np.array(critic_losses).flatten(), np.ones(rolling_length), mode="valid"
+        np.array(learning_losses).flatten(), np.ones(rolling_length), mode="valid"
     )
     / rolling_length
 )
-axs[0][1].plot(critic_losses_moving_average)
-axs[0][1].set_xlabel("Number of updates")
+axs[1].plot(critic_losses_moving_average)
+axs[1].set_xlabel("Number of updates")
 
-
-# actor loss
-axs[1][1].set_title("Actor Loss")
-actor_losses_moving_average = (
-    np.convolve(np.array(actor_losses).flatten(), np.ones(rolling_length), mode="valid")
-    / rolling_length
-)
-axs[1][1].plot(actor_losses_moving_average)
-axs[1][1].set_xlabel("Number of updates")
 
 plt.tight_layout()
-plt.show(block = False)
+plt.show(block=False)
 
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
@@ -397,15 +386,12 @@ while True:
             mask = observation["action_mask"]
             state = observation["observation"]
             if learning_model_round:
-                agent_model = model
-                mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                actions, action_log_probs, state_values, entropy, logits = (
-                    agent_model.select_action(x=state.flatten(), mask=mask_values)
-                )
-                probs = F.softmax(logits, dim=-1)
-                action = np.argmax(probs.detach().numpy())
+                with torch.no_grad():
+                    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+                    x = torch.Tensor(state.flatten()).to(device)
+                    action = model.select_action(x=x, mask=mask_values, epsilon=0, learning=True)
             else:
-                print('Pick action')
+                print("Pick action")
                 action = input()
                 action = np.array(action, dtype=np.int16)
 
