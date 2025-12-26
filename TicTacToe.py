@@ -1,12 +1,15 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from numpy._core.numeric import roll
 import torch
 import torch.nn as nn
 import random
 from pettingzoo.classic import tictactoe_v3
 from torch import cpu, optim
 from torch.nn import functional as F
+from torch.utils.tensorboard.writer import SummaryWriter
 
+writer = SummaryWriter()
 
 class Memory:
     def __init__(self, n_state: torch.Tensor, offset: int):
@@ -93,6 +96,7 @@ model = Value(
 )
 
 
+rolling_length = 100
 learning_losses = []
 first_player_win = []
 first_player_losses = []
@@ -287,8 +291,13 @@ for i in range(EPISODE):
 
     learning_losses.append(loss.detach().cpu().numpy())
 
+    if i > rolling_length:
+        writer.add_scalar('Wins', np.mean(first_player_win[-100:]), i)
+        writer.add_scalar('Losses', np.mean(first_player_losses[-100:]), i)
+        writer.add_scalar('Deuces', np.mean(first_player_deuces[-100:]), i)
+        writer.add_scalar('mse_loss', np.mean(learning_losses[-100:]), i)
 
-rolling_length = 100
+
 fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(12, 5))
 fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
