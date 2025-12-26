@@ -125,6 +125,8 @@ class InnerGame:
             return self.mask.reshape(-1).astype(int)
         else:
             return self.disabled.reshape(-1).astype(int)
+    def to_string(self):
+        print(self.first - self.second)
 
 
 class Status(Enum):
@@ -134,7 +136,7 @@ class Status(Enum):
     P2 = 4
 
 
-EPISODE = 5000
+EPISODE = 500
 LR = 1e-2  # plus stable
 
 model = Value(
@@ -387,10 +389,35 @@ axs[1].set_xlabel("Number of updates")
 
 
 plt.tight_layout()
-# plt.show(block=False)
-plt.show()
+plt.show(block=False)
+# plt.show()
 
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
 
-player = None
+myId = 1
+while True:
+    env.reset()
+    myId = 2 if myId is None or myId == 1 else 1
+    player = 1
+    memory = []
+    done = False
+    me = True
+    status = Status.DEUCE
+    while not done:
+        current_player = player if me else (3 - player)
+        ai = current_player != myId
+        if ai:
+            s, status, mask = env.state(current_player)
+            a = select_action_by_value(
+                state=s, mask=mask
+            )
+        else:
+            env.to_string()
+            print("Pick action")
+            a = input()
+            a = np.array(a, dtype=np.int16)
+        env.step(a, current_player)
+        s, status, mask = env.state(current_player)
+        me = not me
+        done = status != Status.PENDING
