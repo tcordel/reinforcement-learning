@@ -41,12 +41,12 @@ class Value(nn.Module):
         self.n_envs = n_envs
 
         actor_layers = [
-            nn.Linear(n_features, 64),
+            nn.Linear(n_features, 32),
             # nn.ReLU(),
             # nn.Linear(32, 32),
             nn.ReLU(),
             nn.Linear(
-                64, 1
+                32, 1
             ),  # estimate action logits (will be fed into a softmax later)
             nn.Tanh(),
         ]
@@ -82,7 +82,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 2000
+EPISODE = 5000
 LR = 1e-2  # plus stable
 
 model = Value(
