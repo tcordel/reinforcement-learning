@@ -9,67 +9,13 @@ from torch.nn import functional as F
 
 
 class Memory:
-    def __init__(
-        self,
-        state: torch.Tensor,
-        action: int,
-        mask: torch.Tensor,
-        reward: int,
-        n_state: torch.Tensor,
-        n_mask: torch.Tensor,
-        done: int,
-    ):
-        self.state = state
-        self.action = action
-        self.mask = mask
-        self.reward = reward
+    def __init__(self, n_state: torch.Tensor, offset: int):
         self.n_state = n_state
-        self.n_mask = n_mask
-        self.done = done
+        self.offset = offset
         pass
 
 
-class ReplayMemory:
-    def __init__(self, buffer_size: int):
-        self.buffer_size = buffer_size
-        self.buffer = []
-
-    def add(self, item: Memory):
-        if len(self.buffer) == self.buffer_size:
-            self.buffer.pop(0)
-        self.buffer.append(item)
-
-    def clear(self):
-        a = ""
-        # self.buffer = []
-
-    def sample(self, sample_size):
-        # sampling
-        # items = self.buffer
-        items = random.sample(self.buffer, sample_size)
-        # divide each columns
-        states = torch.stack([i.state for i in items], dim=0)
-        masks = torch.stack([i.mask for i in items], dim=0)
-        n_states = torch.stack([i.n_state for i in items], dim=0)
-        n_masks = torch.stack([i.n_mask for i in items], dim=0)
-        actions = [i.action for i in items]
-        rewards = [i.reward for i in items]
-        dones = [i.done for i in items]
-        # convert to tensor
-        actions = torch.tensor(actions, dtype=torch.int64).to(device)
-        rewards = torch.tensor(rewards, dtype=torch.float).to(device)
-        dones = torch.tensor(dones, dtype=torch.float).to(device)
-        # return result
-        return states, masks, actions, rewards, n_states, n_masks, dones
-
-    def length(self):
-        return len(self.buffer)
-
-
-memory = ReplayMemory(buffer_size=10000)
-
-
-class DQN(nn.Module):
+class Value(nn.Module):
     """
     (Synchronous) Advantage Actor-Critic agent class
 
@@ -86,7 +32,6 @@ class DQN(nn.Module):
     def __init__(
         self,
         n_features: int,
-        n_actions: int,
         device: torch.device,
         lr: float,
         n_envs: int,
@@ -94,85 +39,31 @@ class DQN(nn.Module):
         super().__init__()
         self.device = device
         self.n_envs = n_envs
-        self.n_actions = n_actions
 
         actor_layers = [
             nn.Linear(n_features, 32),
             nn.ReLU(),
-            nn.Linear(32, 32),
-            nn.ReLU(),
             nn.Linear(
-                32, n_actions
+                32, 1
             ),  # estimate action logits (will be fed into a softmax later)
+            nn.Tanh(),
         ]
 
         # define actor and critic networks
-        self.q = nn.Sequential(*actor_layers).to(self.device)
-        self.qt = nn.Sequential(*actor_layers).to(self.device)
+        self.value = nn.Sequential(*actor_layers).to(self.device)
 
-        self.optim = optim.Adam(self.q.parameters(), lr=lr)
-        self.update_target()
+        self.optim = optim.Adam(self.value.parameters(), lr=lr)
 
-    def update_target(self):
-        self.qt.load_state_dict(self.q.state_dict())
-
-    def select_action(
-        self, x: torch.Tensor, mask: torch.Tensor, epsilon: float, learning: bool
-    ) -> int:
-        if np.random.random() > epsilon:
-            if learning:
-                q_values = self.q(x)
-            else:
-                q_values = self.qt(x)
-            q_values = q_values.masked_fill(~mask, -np.inf)
-            action = torch.argmax(q_values)
-            action = action.unsqueeze(dim=0)
-            action = action.tolist()[0]
-        else:
-            action = np.random.choice(
-                self.n_actions,
-                p=(mask.float().tolist() / np.sum(mask.float().tolist())),
-            )
-        return action
+    def forward(self, state: torch.Tensor) -> float:
+        return self.value(state).squeeze(-1)
 
     def get_losses(
         self,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
         next_states: torch.Tensor,
-        next_masks: torch.Tensor,
-        dones: torch.Tensor,
-        gamma: float,
+        z: torch.Tensor,
     ) -> torch.Tensor:
-        with torch.no_grad():
-            # compute Q(s_{t+1})                               : size=[batch_size, 2]
-            target_vals_for_all_actions = self.qt(next_states)
-            target_vals_for_all_actions_masked = (
-                target_vals_for_all_actions.masked_fill(~next_masks, -np.inf)
-            )
-            # compute argmax_a Q(s_{t+1})                      : size=[batch_size]
-            target_actions = torch.argmax(target_vals_for_all_actions_masked, 1)
-
-            # compute max Q(s_{t+1})                           : size=[batch_size]
-            target_actions_one_hot = F.one_hot(target_actions, self.n_actions).float()
-            target_vals = torch.sum(
-                target_vals_for_all_actions * target_actions_one_hot, 1
-            )
-            # compute r_t + gamma * (1 - d_t) * max Q(s_{t+1}) : size=[batch_size]
-            target_vals_masked = (1.0 - dones) * target_vals
-            q_vals1 = rewards + gamma * target_vals_masked
-
-        #
-        # Compute q-value
-        #
-        actions_one_hot = F.one_hot(actions, self.n_actions).float()
-        q_vals2 = torch.sum(self.q(states) * actions_one_hot, 1)
-
-        #
-        # Get MSE loss and optimize
-        #
-        loss = F.mse_loss(q_vals1.detach(), q_vals2, reduction="mean")
+        values = self.value(next_states)
+        loss = F.mse_loss(values.squeeze(-1), z)
         return loss
 
     def update_parameters(self, loss: torch.Tensor) -> None:
@@ -188,21 +79,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 10000
-LR = 1e-5  # plus stable
+EPISODE = 1000
+LR = 1e-2  # plus stable
 
-GAMMA = 0.95  # ← clé
-
-epsilon = 1.0
-EPSILON_DECAY = 1.0 / 2000
-EPSILON_FINAL = 0.2
-BATCH_SIZE = 64
-SAMPLING_SIZE = BATCH_SIZE * 30
-TARGET_UPDATE = 2000
-
-model = DQN(
+model = Value(
     n_features=9,
-    n_actions=9,
     device=device,
     lr=LR,
     n_envs=1,
@@ -210,10 +91,38 @@ model = DQN(
 
 
 learning_losses = []
+first_player_win = []
 first_player_losses = []
 first_player_deuces = []
 
 change_level_episode = []
+
+
+def select_action_by_value(env, debug = False):
+    best_v = -1e9
+    best_a = None
+    observation, _, _, _, _ = env.last()
+    s = observation["observation"]
+    x = torch.Tensor(s).to(device)
+    x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
+
+    mask = observation["action_mask"]
+    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+
+    for a in torch.where(mask_values)[0]:
+        state = x.detach().clone()
+        state[a] = 1
+
+        with torch.no_grad():
+            v = model(state)
+
+        if debug:
+            print(f"{a} -> {v}")
+        if v > best_v:
+            best_v = v
+            best_a = a.item()
+
+    return best_a
 
 
 def mesure():
@@ -224,8 +133,9 @@ def mesure():
         env.reset(seed=42)
         player = "player_1"
 
+        first_play = True
         for agent in env.agent_iter():
-            observation, reward, termination, truncation, info = env.last()
+            _, reward, termination, truncation, _ = env.last()
 
             learning_model_round = agent == player
             if termination or truncation:
@@ -238,17 +148,10 @@ def mesure():
                     else:
                         l_loss += 1
             else:
-                with torch.no_grad():
-                    mask = observation["action_mask"]
-                    state = observation["observation"]
-                    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                    x = torch.Tensor(state).to(device)
-                    x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
-                    action = model.select_action(
-                        x=x, mask=mask_values, epsilon=0, learning=True
-                    )
+                action = select_action_by_value(env, i == 0 and first_play)
 
             env.step(action)
+            first_play = False
     return (l_wins, l_deuce, l_loss)
 
 
@@ -305,143 +208,70 @@ def augment_d4(memory: Memory) -> list[Memory]:
     """
     Retourne une liste de Memory
     """
-    s0 = memory.state
-    mask = memory.mask
-    action = memory.action
-    reward = memory.reward
-    s1 = memory.n_state 
-    next_mask = memory.n_mask 
-    done = memory.done
+    s1 = memory.n_state
+    offset = memory.offset
     memories = []
 
     # vue canonique
-    s0 = s0.view(3,3)
-    s1 = s1.view(3,3)
+    s1 = s1.view(3, 3)
 
     for k in range(4):
         # --- rotation ---
-        s_rot = rotate_grid(s0, k)
         ns_rot = rotate_grid(s1, k)
 
-        m_rot = rotate_mask(mask, k)
-        nm_rot = rotate_mask(next_mask, k)
+        memories.append(Memory(n_state=ns_rot.flatten().to(device), offset=offset))
 
-        a_rot = rotate_action(action, k)
-
-        memories.append(
-            Memory(
-                state=s_rot.flatten().to(device),
-                action=a_rot,
-                mask=m_rot.to(device),
-                reward=reward,
-                n_state=ns_rot.flatten().to(device),
-                n_mask=nm_rot.to(device),
-                done=done,
-            )
-        )
-
-        # --- miroir + rotation ---
-        s_m = mirror_grid(s_rot)
         ns_m = mirror_grid(ns_rot)
 
-        m_m = mirror_mask(m_rot)
-        nm_m = mirror_mask(nm_rot)
+        memories.append(Memory(n_state=ns_m.flatten().to(device), offset=offset))
 
-        a_m = mirror_action(a_rot)
-
-        memories.append(
-            Memory(
-                state=s_m.flatten().to(device),
-                action=a_m,
-                mask=m_m.to(device),
-                reward=reward,
-                n_state=ns_m.flatten().to(device),
-                n_mask=nm_m.to(device),
-                done=done,
-            )
-        )
-
+    # memories.append(memory)
     return memories
 
 
 for i in range(EPISODE):
     env.reset(seed=42)
-    player = "player_1" if bool(random.getrandbits(1)) else "player_2"
-    # player = "player_2"
 
-    items = {}
+    memory = []
+    game_p1_reward = 0
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
-        state = observation["observation"]
-        mask = observation["action_mask"]
-        mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-        x = torch.Tensor(state).to(device)
-        x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
 
         if termination or truncation:
             action = None
-            # items[agent].reward = 0.1 if reward == 0 else reward
-            items[agent].reward = reward
-            items[agent].done = 1
-            item_aug = augment_d4(items[agent])
-            for item in range(len(item_aug)):
-                memory.add(item_aug[item])
-            if player == "player_1":
+            if agent == "player_1":
+                game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
+                first_player_win.append(1 if reward == 1 else 0)
 
             env.step(action)
         else:
-            if agent in items:
-                memory.add(items[agent])
-
-            action = model.select_action(
-                x=x, mask=mask_values, epsilon=epsilon, learning=True
-            )
-            item = Memory(state=x, action=action, mask=mask_values, reward=0, done=0,n_state=x, n_mask= mask_values)
-            items[agent] = item
-
+            action = select_action_by_value(env)
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
             state = observation["observation"]
             mask = observation["action_mask"]
             mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
             x = torch.Tensor(state).to(device)
-            x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
+            x = x[:, :, 1].flatten() + x[:, :, 0].flatten() * -1 # next player view...
 
-            if agent in items:
-                items[agent].n_state = x
-                items[agent].n_mask = mask_values
+            frame = Memory(n_state=x, offset=1 if agent == "player_1" else -1)
+            frames = augment_d4(frame)
+            for frames_index in range(len(frames)):
+                memory.append(frames[frames_index ])
 
-    if memory.length() < 5000:
-        continue
+    states = [m.n_state for m in memory]
+    z = [m.offset * game_p1_reward for m in memory]
+    states = torch.stack(states, dim=0)
+    z = torch.Tensor(z)
 
-    loss_cuml = None
-    for t in range(10):
-        states, masks, actions, rewards, n_states, n_masks, dones = memory.sample(
-            BATCH_SIZE
-        )
-        loss = model.get_losses(
-            states, actions, rewards, n_states, n_masks, dones, GAMMA
-        )
-        model.update_parameters(loss)
-        if loss_cuml is None:
-            loss_cuml = loss.detach().cpu().numpy()
-        else:
-            loss_cuml = loss_cuml + loss.detach().cpu().numpy()
+    loss = model.get_losses(
+        next_states=states, z=z
+    )
+    model.update_parameters(loss)
 
-    # Update epsilon
-    if epsilon - EPSILON_DECAY >= EPSILON_FINAL:
-        epsilon -= EPSILON_DECAY
-
-    # log the losses and entropy
-    learning_losses.append(loss_cuml)
-    # if len(losses) > 1000 and np.sum(losses[-500:]) <= 0:
-    #     break
-
-    if i % TARGET_UPDATE == 0:
-        # model.update_target()
-        print(f"update_target ${i}")
+    learning_losses.append(loss.detach().cpu().numpy())
 
 
 rolling_length = 100
@@ -450,6 +280,14 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
 axs[0].set_title("Status")
+if len(first_player_win) > 0:
+    first_win_moving_average = (
+        np.convolve(
+            np.array(first_player_win), np.ones(rolling_length), mode="valid"
+        )
+        / rolling_length
+    )
+    axs[0].plot(first_win_moving_average , label="p1w")
 if len(first_player_losses) > 0:
     first_loss_moving_average = (
         np.convolve(
@@ -457,7 +295,7 @@ if len(first_player_losses) > 0:
         )
         / rolling_length
     )
-    axs[0].plot(first_loss_moving_average, label="p1w")
+    axs[0].plot(first_loss_moving_average, label="p1l")
 if len(first_player_deuces) > 0:
     first_deuce_moving_average = (
         np.convolve(
@@ -501,16 +339,8 @@ while True:
         if termination or truncation:
             action = None
         else:
-            mask = observation["action_mask"]
-            state = observation["observation"]
             if learning_model_round:
-                with torch.no_grad():
-                    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-                    x = torch.Tensor(state).to(device)
-                    x = x[:, :, 0].flatten() + x[:, :, 1].flatten() * -1
-                    action = model.select_action(
-                        x=x, mask=mask_values, epsilon=0, learning=True
-                    )
+                action = select_action_by_value(env_manual)
             else:
                 print("Pick action")
                 action = input()
