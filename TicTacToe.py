@@ -41,19 +41,20 @@ class Value(nn.Module):
         self.n_envs = n_envs
 
         actor_layers = [
-            nn.Linear(n_features, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
+            nn.Linear(n_features, 64),
+            # nn.ReLU(),
+            # nn.Linear(32, 32),
             nn.ReLU(),
             nn.Linear(
-                32, 1
+                64, 1
             ),  # estimate action logits (will be fed into a softmax later)
             nn.Tanh(),
         ]
 
         # define actor and critic networks
         self.value = nn.Sequential(*actor_layers).to(self.device)
-
+        pytorch_total_params = sum(p.numel() for p in self.value.parameters())
+        print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = optim.Adam(self.value.parameters(), lr=lr)
 
     def forward(self, state: torch.Tensor) -> float:
@@ -102,7 +103,7 @@ change_level_episode = []
 softmax = nn.Softmax(dim=0)
 
 
-def select_action_by_value(env, debug=False, train=False, temp=1.):
+def select_action_by_value(env, debug=False, train=False, temp=1.0):
     best_v = -1e9
     best_a = None
     observation, _, _, _, _ = env.last()
@@ -260,19 +261,9 @@ for i in range(EPISODE):
 
             env.step(action)
         else:
-            # if i < 1000:
-            #     mask = observation["action_mask"]
-            #     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
-            #     best_v = -1e9
-            #     action = None
-            #     for a in torch.where(mask_values)[0]:
-            #         v = np.random.random()
-            #         if v > best_v:
-            #             action = a.item()
-            #             best_v = v
-            #
-            # else:
-            action = select_action_by_value(env, train=True, temp= 0.5 if i < 1000 else 0.1)
+            action = select_action_by_value(
+                env, train=True, temp=0.5 if i < 1000 else 0.1
+            )
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
             state = observation["observation"]
@@ -350,9 +341,10 @@ plt.show(block=False)
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
 
+player = None
 while True:
     env_manual.reset(seed=42)
-    player = "player_1"
+    player = "player_2" if player is None or player == "player_1" else "player_1"
     for agent in env_manual.agent_iter():
         observation, reward, termination, truncation, info = env_manual.last()
 
