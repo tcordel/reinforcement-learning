@@ -43,6 +43,8 @@ class Value(nn.Module):
         actor_layers = [
             nn.Linear(n_features, 32),
             nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
             nn.Linear(
                 32, 1
             ),  # estimate action logits (will be fed into a softmax later)
@@ -79,7 +81,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = tictactoe_v3.env()  # render_mode="human")
 env_manual = tictactoe_v3.env(render_mode="human")
 
-EPISODE = 1000
+EPISODE = 2000
 LR = 1e-2  # plus stable
 
 model = Value(
@@ -97,8 +99,10 @@ first_player_deuces = []
 
 change_level_episode = []
 
+softmax = nn.Softmax(dim=0)
 
-def select_action_by_value(env, debug = False):
+
+def select_action_by_value(env, debug=False, train=False, temp=1.):
     best_v = -1e9
     best_a = None
     observation, _, _, _, _ = env.last()
@@ -109,6 +113,8 @@ def select_action_by_value(env, debug = False):
     mask = observation["action_mask"]
     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
 
+    values = []
+    actions = []
     for a in torch.where(mask_values)[0]:
         state = x.detach().clone()
         state[a] = 1
@@ -116,13 +122,19 @@ def select_action_by_value(env, debug = False):
         with torch.no_grad():
             v = model(state)
 
+        values.append(v.item())
+        actions.append(a.item())
         if debug:
             print(f"{a} -> {v}")
         if v > best_v:
             best_v = v
             best_a = a.item()
 
-    return best_a
+    if train:
+        probs = softmax(torch.Tensor(values).to(device) / temp).detach().cpu().numpy()
+        return np.random.choice(actions, p=probs)
+    else:
+        return best_a
 
 
 def mesure():
@@ -240,6 +252,7 @@ for i in range(EPISODE):
         if termination or truncation:
             action = None
             if agent == "player_1":
+                # game_p1_reward = 0.1 if reward == 0 else reward
                 game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
@@ -247,28 +260,38 @@ for i in range(EPISODE):
 
             env.step(action)
         else:
-            action = select_action_by_value(env)
+            # if i < 1000:
+            #     mask = observation["action_mask"]
+            #     mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+            #     best_v = -1e9
+            #     action = None
+            #     for a in torch.where(mask_values)[0]:
+            #         v = np.random.random()
+            #         if v > best_v:
+            #             action = a.item()
+            #             best_v = v
+            #
+            # else:
+            action = select_action_by_value(env, train=True, temp= 0.5 if i < 1000 else 0.1)
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
             state = observation["observation"]
             mask = observation["action_mask"]
             mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
             x = torch.Tensor(state).to(device)
-            x = x[:, :, 1].flatten() + x[:, :, 0].flatten() * -1 # next player view...
+            x = x[:, :, 1].flatten() + x[:, :, 0].flatten() * -1
 
             frame = Memory(n_state=x, offset=1 if agent == "player_1" else -1)
             frames = augment_d4(frame)
             for frames_index in range(len(frames)):
-                memory.append(frames[frames_index ])
+                memory.append(frames[frames_index])
 
     states = [m.n_state for m in memory]
     z = [m.offset * game_p1_reward for m in memory]
     states = torch.stack(states, dim=0)
     z = torch.Tensor(z)
 
-    loss = model.get_losses(
-        next_states=states, z=z
-    )
+    loss = model.get_losses(next_states=states, z=z)
     model.update_parameters(loss)
 
     learning_losses.append(loss.detach().cpu().numpy())
@@ -282,12 +305,10 @@ fig.suptitle("Training plots for A2C in the TicTacToe environment")
 axs[0].set_title("Status")
 if len(first_player_win) > 0:
     first_win_moving_average = (
-        np.convolve(
-            np.array(first_player_win), np.ones(rolling_length), mode="valid"
-        )
+        np.convolve(np.array(first_player_win), np.ones(rolling_length), mode="valid")
         / rolling_length
     )
-    axs[0].plot(first_win_moving_average , label="p1w")
+    axs[0].plot(first_win_moving_average, label="p1w")
 if len(first_player_losses) > 0:
     first_loss_moving_average = (
         np.convolve(
