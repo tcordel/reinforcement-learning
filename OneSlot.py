@@ -1,13 +1,71 @@
-from collections import deque
+import matplotlib.pyplot as plt
 import numpy as np
-import numpy.random as random
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from enum import Enum
-import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def idx_to_coord(a):
+    return a // 3, a % 3
+
+
+def coord_to_idx(i, j):
+    return i * 3 + j
+
+class Memory:
+    def __init__(self, n_state: torch.Tensor, offset: int):
+        self.n_state = n_state
+        self.offset = offset
+        pass
+
+
+class Value(nn.Module):
+    def __init__(
+        self,
+        n_features: int,
+        device: torch.device,
+        lr: float,
+        n_envs: int,
+    ) -> None:
+        super().__init__()
+        self.device = device
+        self.n_envs = n_envs
+
+        actor_layers = [
+            nn.Linear(n_features, 32),
+            # nn.ReLU(),
+            # nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(
+                32, 1
+            ),  # estimate action logits (will be fed into a softmax later)
+            nn.Tanh(),
+        ]
+
+        # define actor and critic networks
+        self.value = nn.Sequential(*actor_layers).to(self.device)
+        pytorch_total_params = sum(p.numel() for p in self.value.parameters())
+        print(f"Number of parameters -> {pytorch_total_params}")
+        self.optim = torch.optim.Adam(self.value.parameters(), lr=lr)
+
+    def forward(self, state: torch.Tensor) -> float:
+        return self.value(state).squeeze(-1)
+
+    def get_losses(
+        self,
+        next_states: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        values = self.value(next_states)
+        loss = F.mse_loss(values.squeeze(-1), z)
+        return loss
+
+    def update_parameters(self, loss: torch.Tensor) -> None:
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
 
 
 def win(board):
@@ -44,8 +102,8 @@ class InnerGame:
         # vérifie validité
         if a < 0 or a >= 9:
             raise ValueError("Action out of range")
-        r = int(a / 3)
-        c = int(a % 3)
+        r,c = idx_to_coord(a)
+        
         if self.mask[r, c] != 1:
             raise Exception("Coup illégal")
         board = self.first if player == 1 else self.second
@@ -76,340 +134,263 @@ class Status(Enum):
     P2 = 4
 
 
-class ActorNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.l1 = nn.Linear(18, 18)
-        self.output = nn.Linear(18, 9)
+EPISODE = 5000
+LR = 1e-2  # plus stable
 
-    def forward(self, s):
-        outs = s.view(-1, 18)
-        outs = self.l1(outs)
-        outs = F.relu(outs)
-        outs = self.output(outs)
-        return outs
+model = Value(
+    n_features=9,
+    device=device,
+    lr=LR,
+    n_envs=1,
+)
 
-
-class ValueNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.l1 = nn.Linear(18, 18)
-        self.output = nn.Linear(18, 1)
-
-    def forward(self, s):
-        outs = s.view(-1, 18)
-        outs = self.l1(outs)
-        outs = F.relu(outs)
-        outs = self.output(outs)
-        return outs
+rolling_length = 100
+learning_losses = []
+first_player_win = []
+first_player_losses = []
+first_player_deuces = []
 
 
-def idx_to_rc(idx):
-    return divmod(idx, 3)
+softmax = nn.Softmax(dim=0)
 
 
-def rc_to_idx(r, c):
-    return r * 3 + c
+def cannonical_state(state) -> torch.Tensor:
+    x = torch.Tensor(state).to(device)
+    x = x[0, :, :].flatten() + x[1, :, :].flatten() * -1
+    return x
 
 
-def apply_transform(
-    state_t: torch.Tensor, mask_flat: np.ndarray, action: int, t_id: int
-):
-    s = state_t.clone()
-    mask2d = mask_flat.reshape(3, 3).copy()  # numpy 9x9
-    r, c = idx_to_rc(action)
+def select_action_by_value(state, mask, debug=False, train=False, temp=1.0):
+    best_v = -1e9
+    best_a = None
 
-    if t_id == 0:  # identity
-        pass
-    elif t_id == 1:  # rot90
-        s = torch.rot90(s, 1, (1, 2))
-        mask2d = np.rot90(mask2d, 1)
-        r, c = c, 8 - r
-    elif t_id == 2:  # rot180
-        s = torch.rot90(s, 2, (1, 2))
-        mask2d = np.rot90(mask2d, 2)
-        r, c = 2 - r, 2 - c
-    elif t_id == 3:  # rot270
-        s = torch.rot90(s, 3, (1, 2))
-        mask2d = np.rot90(mask2d, 3)
-        r, c = 2 - c, r
-    elif t_id == 4:  # flip horizontal
-        s = torch.flip(s, [1])
-        mask2d = np.flipud(mask2d)
-        r = 2 - r
-    elif t_id == 5:  # flip vertical
-        s = torch.flip(s, [2])
-        mask2d = np.fliplr(mask2d)
-        c = 2 - c
-    elif t_id == 6:  # flip + rot90
-        s = torch.flip(s, [1])
-        s = torch.rot90(s, 1, (1, 2))
-        mask2d = np.rot90(np.flipud(mask2d), 1)
-        r, c = c, r
-    elif t_id == 7:  # flip + rot270
-        s = torch.flip(s, [1])
-        s = torch.rot90(s, 3, (1, 2))
-        mask2d = np.rot90(np.flipud(mask2d), 3)
-        r, c = 2 - c, 2 - r
+    x = cannonical_state(state)
+    mask_values = torch.tensor(mask, dtype=torch.bool, device=device).flatten()
 
-    new_action = rc_to_idx(r, c)
-    new_mask_flat = mask2d.reshape(-1).astype(int).copy()
-    return s.cpu().numpy().copy(), new_mask_flat, int(new_action)
+    values = []
+    actions = []
+    for a in torch.where(mask_values)[0]:
+        state = x.detach().clone()
+        state[a] = 1
 
-
-def augment_state(state_np, mask_flat, action):
-    # state_np: numpy (2,9,9)
-    s_t = torch.tensor(state_np, dtype=torch.float)
-    out = []
-    for t in range(8):
-        s_aug, m_aug, a_aug = apply_transform(s_t, mask_flat, action, t)
-        out.append((s_aug, m_aug, a_aug))
-    return out
-
-
-if __name__ == "__main__":
-    # instantiate nets properly
-    actor_func = ActorNet().to(device)
-    opp_func = ActorNet().to(device)
-    opp_func.load_state_dict(actor_func.state_dict())  # copy weights
-    legacy = ActorNet().to(device)
-    legacy.load_state_dict(actor_func.state_dict())
-
-    value_func = ValueNet().to(device)
-
-    batch_size = 64
-    gamma = 0.99
-    kl_coeff = 1  # weight coefficient for KL-divergence loss
-    vf_coeff = 0.10  # weight coefficient for value loss
-
-    # pick up action with above distribution policy_pi
-    def pick_sample(s, mask, fun):
         with torch.no_grad():
-            s_batch = np.expand_dims(s, axis=0)
-            s_batch = torch.tensor(s_batch, dtype=torch.float, device=device)
-            logits = fun(s_batch)  # shape (1,9)
-            mask_t = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(
-                0
-            )  # (1,9)
-            # remplacer invalides par -inf
-            large_neg = -1e9
-            logits = logits.masked_fill(~mask_t, large_neg)
-            logits = logits.squeeze(0)  # (9,)
-            # si toutes masquées (improbable), choisir aléatoire
-            if mask.sum() == 0:
-                raise Exception("Should not be here")
-            probs = F.softmax(logits, dim=-1)
-            a = torch.multinomial(probs, num_samples=1)
-            a = a.squeeze(dim=0)
-            # logprb = -F.cross_entropy(logits, a, reduction="none")
-            return a.tolist()  # , logits.tolist(), logprb.tolist()
+            v = model(state)
 
-    all_params = list(actor_func.parameters()) + list(value_func.parameters())
-    opt = torch.optim.AdamW(all_params, lr=0.05)
-    env = InnerGame()
+        values.append(v.item())
+        actions.append(a.item())
+        if debug:
+            print(f"{a} -> {v}")
+        if v > best_v:
+            best_v = v
+            best_a = a.item()
 
-    evolve = False
-    LEVEL = 5000
-    evolve_counter = 0
-    for level in range(LEVEL):
-        # identifiants pour tes réseaux
-        PLAYER_CUR = "current"
-        PLAYER_OPP = "opponent"
+    if train:
+        probs = softmax(torch.Tensor(values).to(device) / temp).detach().cpu().numpy()
+        return np.random.choice(actions, p=probs)
+    else:
+        return best_a
 
-        reward_records = []
-        reward_history = deque(maxlen=200)
-        win_history = deque(maxlen=200)
-        print("Level -> {}".format(level))
-        if evolve:
-            evolve_counter = evolve_counter + 1
-            evolve = False
-            opp_func.load_state_dict(actor_func.state_dict())
-            torch.save(actor_func.state_dict(), f"./simple-kl-{level}.pth")
-            evolve_counter = 0
+
+env = InnerGame()
+
+
+def mesure():
+    l_wins = 0
+    l_deuce = 0
+    l_loss = 0
+
+    for i in range(100):
+        done = False
+        player = 1
+        me = True
+        env.reset()
+        status = Status.DEUCE
+        while not done:
+            s, status, mask = env.state(player if me else (3 - player))
+            a = select_action_by_value(
+                state=s, mask=mask, train=False
+            )
+            env.step(a, player if me else (3 - player))
+            s, status, mask = env.state(player if me else (3 - player))
+            me = not me
+            done = status != Status.PENDING
+        reward = 1 if status == Status.P1 else (-1 if status == Status.P2 else 0)
+
+        if reward == 1:
+            l_wins += 1
+        elif reward == 0:
+            l_deuce += 1
         else:
-            print("Not evolving !!! ", flush=True)
+            l_loss += 1
 
-        for i in range(100000):
-            done = False
-            myId = random.randint(1, 2)
-            env.reset()
-            me = myId == 1
-            transitions = []
-            s, status, mask = env.state(myId if me else (3 - myId))
-            while not done:
-                fun = actor_func if me else opp_func
-                mask = env.valid_mask()
-                a = pick_sample(s, mask, fun)
-                # store mask for training only for 'me' states (we train policy of 'me' only)
-                if me:
-                    transitions.append([(s, mask, a)])
-                env.step(a, myId if me else (3 - myId))
-                me = not me
-                s, status, mask = env.state(myId if me else (3 - myId))
-                done = status != Status.PENDING
+    return (l_wins, l_deuce, l_loss)
 
-            # final reward to last move of player 1
-            r = (
-                1.0
-                if (status == Status.P1 if myId == 1 else status == Status.P2)
-                else (
-                    0.0
-                    if (status == Status.P2 if myId == 1 else status == Status.P1)
-                    else 0.1
-                )
-            )
 
-            elo_score_curr = 0.5 if r == 0.1 else r
-            win_history.append(r)
+i_win, i_deuce, i_loss = mesure()
+print(f"{i_win},{i_deuce},{i_loss}")
 
-            # cumulative rewards
-            reward_len = len(transitions)
-            cum_rewards = np.zeros(reward_len, dtype=float)
-            for j in reversed(range(reward_len)):
-                cum_rewards[j] = 0 + (
-                    cum_rewards[j + 1] * gamma if j + 1 < reward_len else r
-                )
 
-            reward_records.append(r)
-            reward_history.append(r)
 
-            buffer = []
-            with torch.no_grad():
-                for j in range(reward_len):
-                    augmented_state = transitions[j]
-                    for k in range(len(augmented_state)):
-                        s, m, a = augmented_state[k]
-                        s_batch = np.expand_dims(s, axis=0)
-                        s_batch = torch.tensor(
-                            s_batch, dtype=torch.float, device=device
-                        )
-                        logits_v = actor_func(s_batch)  # shape (1,9)
-                        mask_t = torch.tensor(
-                            m, dtype=torch.bool, device=device
-                        ).unsqueeze(0)  # (1,9)
-                        # remplacer invalides par -inf
-                        large_neg = -1e9
-                        logits_v = logits_v.masked_fill(~mask_t, large_neg)
-                        logits_v = logits_v.squeeze(0)  # (9,)
-                        # si toutes masquées (improbable), choisir aléatoire
-                        if m.sum() == 0:
-                            raise Exception("Should not be here")
-                        probs = F.softmax(logits_v, dim=-1)
-                        a = torch.multinomial(probs, num_samples=1)
-                        a = a.squeeze(dim=0)
-                        logprb = -F.cross_entropy(logits_v, a, reduction="none")
 
-                        buffer.append(
-                            (
-                                s,
-                                a,
-                                cum_rewards[j],
-                                m,
-                                logits_v.tolist(),
-                                logprb.tolist(),
-                            )
-                        )
+def rotate_coord_90(i, j):
+    return j, 2 - i
 
-            mmm = np.mean(win_history)
-            vf_loss_history = deque(maxlen=200)
-            pi_loss_history = deque(maxlen=200)
-            kl_history = deque(maxlen=200)
 
-            states, actions, cum_rewards, masks, logits_old, logprbs = zip(*buffer)
-            states = torch.tensor(list(states), dtype=torch.float).to(device)
-            actions = torch.tensor(list(actions), dtype=torch.int64).to(device)
-            cum_rewards = torch.tensor(list(cum_rewards), dtype=torch.float).to(device)
-            masks = torch.tensor(list(masks), dtype=torch.bool).to(device)
-            logits_old = torch.tensor(list(logits_old), dtype=torch.float).to(device)
-            logprbs = torch.tensor(list(logprbs), dtype=torch.float).to(device)
-            # Convert to tensor
-            # states = torch.tensor(states, dtype=torch.float).to(device)
-            # actions = torch.tensor(actions, dtype=torch.int64).to(device)
-            # masks = torch.tensor(masks, dtype=torch.bool).to(device)
-            # logits_old = torch.tensor(logits, dtype=torch.float).to(device)
-            # logprbs = torch.tensor(logprbs, dtype=torch.float).to(device)
-            # logprbs = logprbs.unsqueeze(dim=1)
-            # cum_rewards = torch.tensor(rewards, dtype=torch.float).to(device)
-            # cum_rewards = cum_rewards.unsqueeze(dim=1)
-            # Get values and logits with new paraked_fill(~masks, large_neg)
-            values_new = value_func(states)
-            logits_new = actor_func(states)
+def rotate_action(action, k):
+    i, j = idx_to_coord(action)
+    for _ in range(k):
+        i, j = rotate_coord_90(i, j)
+    return coord_to_idx(i, j)
 
-            large_neg = -1e9
-            logits_new = logits_new.masked_fill(~masks, large_neg)
 
-            # Get advantages
-            advantages = cum_rewards - values_new
-            ### # Uncomment if you use normalized advantages (see above note)
-            ### advantages = (advantages - advantages.mean()) / advantages.std()
-            # Calculate P_new / P_old
-            logprbs_new = -F.cross_entropy(logits_new, actions, reduction="none")
-            logprbs_new = logprbs_new.unsqueeze(dim=1)
-            prob_ratio = torch.exp(logprbs_new - logprbs)
-            # Calculate KL-div for Categorical distribution (see above)
-            l0 = logits_old - torch.amax(
-                logits_old, dim=1, keepdim=True
-            )  # reduce quantity
-            l1 = logits_new - torch.amax(
-                logits_new, dim=1, keepdim=True
-            )  # reduce quantity
-            e0 = torch.exp(l0)
-            e1 = torch.exp(l1)
-            e_sum0 = torch.sum(e0, dim=1, keepdim=True)
-            e_sum1 = torch.sum(e1, dim=1, keepdim=True)
-            p0 = e0 / e_sum0
-            kl = torch.sum(
-                p0 * (l0 - torch.log(e_sum0) - l1 + torch.log(e_sum1)),
-                dim=1,
-                keepdim=True,
-            )
-            # Get value loss
-            vf_loss = F.mse_loss(values_new, cum_rewards, reduction="none")
-            pi_loss = -advantages * prob_ratio
-            # Get total loss
-            loss = pi_loss + kl * kl_coeff + vf_loss * vf_coeff
-            # Optimize
+def mirror_coord(i, j):
+    return i, 2 - j
 
-            opt.zero_grad()
-            loss.sum().backward()
-            opt.step()
-            vf_loss_history.append(vf_loss.mean().item())
-            pi_loss_history.append(pi_loss.mean().item())
-            kl_history.append(kl.mean().item())
 
-            if len(reward_records) >= 100:
-                diff_elo = np.sum(reward_records[-100:])
+def mirror_action(action):
+    i, j = idx_to_coord(action)
+    i, j = mirror_coord(i, j)
+    return coord_to_idx(i, j)
 
-                # if i > 0 and i % 10 == 0:
-                # print(
-                #     "Level {} processing !!! , last 100 avg reward {:.3f}".format(
-                #         level, np.mean(reward_records[-100:]) if reward_records else 0.0
-                #     )
-                # )
-                #
-                print(
-                    "episode {} with avg reward {:.3f}".format(
-                        i, np.average(reward_records[-100:])
-                    ),
-                    flush=True,
-                )
-                if diff_elo > 60:
-                    evolve = True
-                    print(
-                        "Stop at episode {} with avg reward {:.3f}".format(
-                            i, np.average(reward_records[-100:])
-                        ),
-                        flush=True,
-                    )
-                    break
 
-        # print(
-        #     f"[Level {level}] avg reward={np.mean(reward_history):.3f}, "
-        #     f"winrate={np.mean(win_history) * 100:.1f}%, "
-        #     f"vf_loss={np.mean(vf_loss_history):.4f}, "
-        #     f"pi_loss={np.mean(pi_loss_history):.4f}",
-        #     f"kl={np.mean(kl_history):.4f}",
-        # )
+def rotate_grid(x, k):
+    return torch.rot90(x, k, dims=(0, 1))
 
-    torch.save(actor_func.state_dict(), "./simple-kl-final.pth")
-    print("\nDone")
+
+def mirror_grid(x):
+    return torch.flip(x, dims=(1,))  # miroir horizontal
+
+
+def rotate_mask(mask, k):
+    return rotate_grid(mask.view(3, 3), k).flatten()
+
+
+def mirror_mask(mask):
+    return mirror_grid(mask.view(3, 3)).flatten()
+
+
+def augment_d4(memory: Memory) -> list[Memory]:
+    """
+    Retourne une liste de Memory
+    """
+    s1 = memory.n_state
+    offset = memory.offset
+    memories = []
+
+    # vue canonique
+    s1 = s1.view(3, 3)
+
+    for k in range(4):
+        # --- rotation ---
+        ns_rot = rotate_grid(s1, k)
+
+        memories.append(Memory(n_state=ns_rot.flatten().to(device), offset=offset))
+
+        ns_m = mirror_grid(ns_rot)
+
+        memories.append(Memory(n_state=ns_m.flatten().to(device), offset=offset))
+
+    # memories.append(memory)
+    return memories
+
+
+for i in range(EPISODE):
+    env.reset()
+    memory = []
+    done = False
+    player = 1
+    me = True
+    env.reset()
+    status = Status.DEUCE
+    while not done:
+        fun = model
+        s, status, mask = env.state(player if me else (3 - player))
+        a = select_action_by_value(
+            state=s, mask=mask, train=True, temp=0.5 if i < 1000 else 0.1
+        )
+        env.step(a, player if me else (3 - player))
+        s, status, mask = env.state(player if me else (3 - player))
+        me = not me
+        done = status != Status.PENDING
+        frame = Memory(n_state=cannonical_state(s), offset=1 if me else -1)
+        frames = augment_d4(frame)
+        for frames_index in range(len(frames)):
+            memory.append(frames[frames_index])
+
+    # final reward to last move of player 1
+    reward = 1.0 if (status == Status.P1) else (-1 if (status == Status.P2) else 0)
+    first_player_losses.append(1 if reward == -1 else 0)
+    first_player_deuces.append(1 if reward == 0 else 0)
+    first_player_win.append(1 if reward == 1 else 0)
+
+    states = [m.n_state for m in memory]
+    z = [m.offset * reward for m in memory]
+    states = torch.stack(states, dim=0)
+    z = torch.Tensor(z)
+
+    loss = model.get_losses(next_states=states, z=z)
+    model.update_parameters(loss)
+
+    learning_losses.append(loss.detach().cpu().numpy())
+
+    # if i > rolling_length:
+    #     writer.add_scalar("Wins", np.mean(first_player_win[-100:]), i)
+    #     writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), i)
+    #     writer.add_scalar("Deuces", np.mean(first_player_deuces[-100:]), i)
+    #     writer.add_scalar("mse_loss", np.mean(learning_losses[-100:]), i)
+
+
+fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(12, 5))
+fig.suptitle("Training plots for A2C in the TicTacToe environment")
+
+# entropy
+axs[0].set_title("Status")
+if len(first_player_win) > 0:
+    first_win_moving_average = (
+        np.convolve(np.array(first_player_win), np.ones(rolling_length), mode="valid")
+        / rolling_length
+    )
+    axs[0].plot(first_win_moving_average, label="p1w")
+if len(first_player_losses) > 0:
+    first_loss_moving_average = (
+        np.convolve(
+            np.array(first_player_losses), np.ones(rolling_length), mode="valid"
+        )
+        / rolling_length
+    )
+    axs[0].plot(first_loss_moving_average, label="p1l")
+if len(first_player_deuces) > 0:
+    first_deuce_moving_average = (
+        np.convolve(
+            np.array(first_player_deuces), np.ones(rolling_length), mode="valid"
+        )
+        / rolling_length
+    )
+    axs[0].plot(first_deuce_moving_average, label="p1d")
+
+# for i in change_level_episode:
+#     axs[0][0].vlines(i, 0, 1)
+# axs[0][0].plot(deuces_moving_average)
+# axs[0][0].plot(losses_moving_average)
+axs[0].set_xlabel("Number of updates")
+axs[0].legend()
+#  loss
+axs[1].set_title("Loss")
+critic_losses_moving_average = (
+    np.convolve(
+        np.array(learning_losses).flatten(), np.ones(rolling_length), mode="valid"
+    )
+    / rolling_length
+)
+axs[1].plot(critic_losses_moving_average)
+axs[1].set_xlabel("Number of updates")
+
+
+plt.tight_layout()
+# plt.show(block=False)
+plt.show()
+
+i_win, i_deuce, i_loss = mesure()
+print(f"{i_win},{i_deuce},{i_loss}")
+
+player = None

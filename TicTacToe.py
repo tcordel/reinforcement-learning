@@ -19,18 +19,6 @@ class Memory:
 
 
 class Value(nn.Module):
-    """
-    (Synchronous) Advantage Actor-Critic agent class
-
-    Args:
-        n_features: The number of features of the input state.
-        n_actions: The number of actions the agent can take.
-        device: The device to run the computations on (running on a GPU might be quicker for larger Neural Nets,
-                for this code CPU is totally fine).
-        critic_lr: The learning rate for the critic network (should usually be larger than the actor_lr).
-        actor_lr: The learning rate for the actor network.
-        n_envs: The number of environments that run in parallel (on multiple CPUs) to collect experiences.
-    """
 
     def __init__(
         self,
