@@ -35,7 +35,7 @@ class Value(nn.Module):
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(),
         ]
-        fc_layers = [nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1), nn.Tanh()]
+        fc_layers = [nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1)]
 
         # define actor and critic networks
         self.conv = nn.Sequential(*conv_layers).to(self.device)
@@ -46,8 +46,8 @@ class Value(nn.Module):
         )
         print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
 
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         conv = self.conv(state)
         mean = conv.mean(dim=(2, 3))
         fc = self.head(mean)
@@ -59,18 +59,17 @@ class Value(nn.Module):
         T = len(memory)
         vs = []
         targets = np.zeros(T)
-        R = reward
         for i in reversed(range(T)):
             frame = memory[i]
-            # s = frame.state
-            # v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
-            # vs.append(v)
-            ns = frame.n_state
-            v = self.forward(ns.unsqueeze(dim=0)).squeeze(-1)
+            s = frame.state
+            v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
             vs.append(v)
-            if i != T - 1:
-                R = gamma * R
-            targets[i] = R * frame.offset
+            if i == T - 1:
+                target = reward * frame.offset
+            else:
+                ns = frame.n_state
+                target = self.forward(ns.unsqueeze(dim=0)).item() * gamma
+            targets[i] = target
 
         vs = torch.cat(vs)
         targets = torch.tensor(targets, dtype=torch.float)
@@ -90,7 +89,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 2000
+EPISODE = 2500
 LR = 1e-3  # plus stable
 GAMMA = 0.9
 
@@ -114,8 +113,9 @@ softmax = nn.Softmax(dim=0)
 
 def cannonical_state(s):
     x = torch.Tensor(s).to(device)
-    x = x.permute(2,1,0)
+    x = x.permute(2, 1, 0)
     return x
+
 
 def select_action_by_value(env, debug=False, train=False, temp=1.0):
     best_v = -1e9
@@ -134,7 +134,7 @@ def select_action_by_value(env, debug=False, train=False, temp=1.0):
 
         slots = torch.where(state[0][a] + state[1][a] == 0)[0]
         column = slots[slots.size()[0] - 1]
-        state[0,a,column] = 1
+        state[0, a, column] = 1
 
         with torch.no_grad():
             v = model(state.unsqueeze(dim=0))
