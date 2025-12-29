@@ -264,14 +264,6 @@ class Game:
         #     print()
 
 
-EPISODE = 5000000
-LR = 3e-4  # plus stable
-
-model = Value(
-    device=device,
-    lr=LR,
-    n_envs=1,
-)
 
 rolling_length = 100
 learning_losses = []
@@ -288,15 +280,8 @@ def cannonical_state(state) -> torch.Tensor:
     # x = x[0, :, :].flatten() + x[1, :, :].flatten() * -1
     return x
 
-def temperature(episode):
-    if episode < 20_000:
-        return 1.0
-    elif episode < 60_000:
-        return 0.5
-    else:
-        return 0.25
 
-def select_action_by_value(state, mask, debug=False, train=False, temp=1.0):
+def select_action_by_value(agent, state, mask, debug=False, train=False, temp=1.0):
     best_v = -1e9
     best_a = None
 
@@ -311,7 +296,7 @@ def select_action_by_value(state, mask, debug=False, train=False, temp=1.0):
         state[0, r, c] = 1
 
         with torch.no_grad():
-            v = model(state.unsqueeze(0))
+            v = agent(state.unsqueeze(0))
 
         values.append(v.item())
         actions.append(a.item())
@@ -331,7 +316,7 @@ def select_action_by_value(state, mask, debug=False, train=False, temp=1.0):
 env = Game()
 
 
-def mesure():
+def mesure(a1, a2):
     l_wins = 0
     l_deuce = 0
     l_loss = 0
@@ -344,7 +329,8 @@ def mesure():
         status = Status.DEUCE
         while not done:
             s, status, mask = env.state(player if me else (3 - player))
-            a = select_action_by_value(state=s, mask=mask, train=False)
+            agent = a1 if me else a2
+            a = select_action_by_value(agent=agent, state=s, mask=mask, train=False)
             env.step(a, player if me else (3 - player))
             s, status, mask = env.state(player if me else (3 - player))
             me = not me
@@ -360,158 +346,26 @@ def mesure():
 
     return (l_wins, l_deuce, l_loss)
 
+a1 = Value(
+    device=device,
+    lr=0,
+    n_envs=1,
+)
 
-i_win, i_deuce, i_loss = mesure()
+a2 = Value(
+    device=device,
+    lr=0,
+    n_envs=1,
+)
+
+a1.conv.load_state_dict(torch.load("./conv-500.pth", map_location="cpu"))
+a1.head.load_state_dict(torch.load("./head-500.pth", map_location="cpu"))
+
+a2.conv.load_state_dict(torch.load("./conv-1028500.pth", map_location="cpu"))
+a2.head.load_state_dict(torch.load("./head-1028500.pth", map_location="cpu"))
+i_win, i_deuce, i_loss = mesure(a1, a2)
 print(f"{i_win},{i_deuce},{i_loss}")
 
 
-WIDTH = 9
-
-
-def rotate_coord_90(i, j):
-    return j, (WIDTH - 1) - i
-
-
-def mirror_coord(i, j):
-    return i, (WIDTH - 1) - j
-
-
-def rotate_grid(x, k):
-    return torch.rot90(x, k, dims=(1, 2))
-
-
-def mirror_grid(x):
-    return torch.flip(x, dims=(1,))  # miroir horizontal
-
-
-def rotate_mask(mask, k):
-    return rotate_grid(mask.view(WIDTH, WIDTH), k).flatten()
-
-
-def mirror_mask(mask):
-    return mirror_grid(mask.view(WIDTH, WIDTH)).flatten()
-
-
-def augment_d4(memory: Memory) -> list[Memory]:
-    """
-    Retourne une liste de Memory
-    """
-    s1 = memory.n_state
-    offset = memory.offset
-    memories = []
-
-    for k in range(4):
-        # --- rotation ---
-        ns_rot = rotate_grid(s1, k)
-
-        memories.append(Memory(n_state=ns_rot.to(device), offset=offset))
-
-        ns_m = mirror_grid(ns_rot)
-
-        memories.append(Memory(n_state=ns_m.to(device), offset=offset))
-
-    # memories.append(memory)
-    return memories
-
-
-for i in range(EPISODE):
-    env.reset()
-    memory = []
-    done = False
-    player = 1
-    me = True
-    env.reset()
-    status = Status.DEUCE
-    while not done:
-        fun = model
-        s, status, mask = env.state(player if me else (3 - player))
-        temp = temperature(i)
-        a = select_action_by_value( state=s, mask=mask, train=True, temp=temp)
-        env.step(a, player if me else (3 - player))
-        s, status, mask = env.state(player if me else (3 - player))
-        me = not me
-        done = status != Status.PENDING
-        frame = Memory(n_state=cannonical_state(s), offset=1 if me else -1)
-        frames = augment_d4(frame)
-        for frames_index in range(len(frames)):
-            memory.append(frames[frames_index])
-
-    # final reward to last move of player 1
-    reward = 1.0 if (status == Status.P1) else (-1 if (status == Status.P2) else 0)
-    first_player_losses.append(1 if reward == -1 else 0)
-    first_player_deuces.append(1 if reward == 0 else 0)
-    first_player_win.append(1 if reward == 1 else 0)
-
-    states = [m.n_state for m in memory]
-    z = [m.offset * reward for m in memory]
-    states = torch.stack(states, dim=0)
-    z = torch.Tensor(z)
-
-    loss = model.get_losses(next_states=states, z=z)
-    model.update_parameters(loss)
-
-    learning_losses.append(loss.detach().cpu().numpy())
-
-    if i > 0 and i%500==0:
-        torch.save(model.conv.state_dict(), f"./conv-{i}.pth")
-        torch.save(model.head.state_dict(), f"./head-{i}.pth")
-
-    if i > rolling_length:
-        writer.add_scalar("Wins", np.mean(first_player_win[-100:]), i)
-        writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), i)
-        writer.add_scalar("Deuces", np.mean(first_player_deuces[-100:]), i)
-        writer.add_scalar("mse_loss", np.mean(learning_losses[-100:]), i)
-
-
-# fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(12, 5))
-# fig.suptitle("Training plots for A2C in the TicTacToe environment")
-#
-# # entropy
-# axs[0].set_title("Status")
-# if len(first_player_win) > 0:
-#     first_win_moving_average = (
-#         np.convolve(np.array(first_player_win), np.ones(rolling_length), mode="valid")
-#         / rolling_length
-#     )
-#     axs[0].plot(first_win_moving_average, label="p1w")
-# if len(first_player_losses) > 0:
-#     first_loss_moving_average = (
-#         np.convolve(
-#             np.array(first_player_losses), np.ones(rolling_length), mode="valid"
-#         )
-#         / rolling_length
-#     )
-#     axs[0].plot(first_loss_moving_average, label="p1l")
-# if len(first_player_deuces) > 0:
-#     first_deuce_moving_average = (
-#         np.convolve(
-#             np.array(first_player_deuces), np.ones(rolling_length), mode="valid"
-#         )
-#         / rolling_length
-#     )
-#     axs[0].plot(first_deuce_moving_average, label="p1d")
-#
-# # for i in change_level_episode:
-# #     axs[0][0].vlines(i, 0, 1)
-# # axs[0][0].plot(deuces_moving_average)
-# # axs[0][0].plot(losses_moving_average)
-# axs[0].set_xlabel("Number of updates")
-# axs[0].legend()
-# #  loss
-# axs[1].set_title("Loss")
-# critic_losses_moving_average = (
-#     np.convolve(
-#         np.array(learning_losses).flatten(), np.ones(rolling_length), mode="valid"
-#     )
-#     / rolling_length
-# )
-# axs[1].plot(critic_losses_moving_average)
-# axs[1].set_xlabel("Number of updates")
-#
-#
-# plt.tight_layout()
-# # plt.show(block=False)
-# plt.show()
-
-i_win, i_deuce, i_loss = mesure()
+i_win, i_deuce, i_loss = mesure(a2, a1)
 print(f"{i_win},{i_deuce},{i_loss}")
