@@ -1,9 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from enum import Enum
 from torch.utils.tensorboard.writer import SummaryWriter
+from torch.nn import functional as F
 
 writer = SummaryWriter()
 
@@ -18,8 +18,75 @@ def coord_to_idx(i, j):
     return i * 3 + j
 
 
+class Node:
+    def __init__(self, state, player):
+        self.state = state
+        self.player = player
+        self.N = 0
+        self.W = 0.0
+        self.children = {}  # action -> Node
+
+
+def mcts_search(root_state, env, value_net, n_sim=50, c_puct=1.0, gamma=0.99):
+    root = Node(root_state, player=1)
+
+    for _ in range(n_sim):
+        node = root
+        sim_env = env.clone()
+        path = []
+
+        # 1️⃣ Selection
+        while node.children:
+            best_score = -1e9
+            best_action = None
+            best_child = None
+
+            for a, child in node.children.items():
+                Q = child.W / child.N if child.N > 0 else 0
+                U = c_puct * (node.N**0.5) / (1 + child.N)
+                score = Q + U
+                if score > best_score:
+                    best_score = score
+                    best_action = a
+                    best_child = child
+
+            sim_env.step(best_action)
+            path.append(node)
+            node = best_child
+
+        # 2️⃣ Expansion
+        obs, reward, done, _ = sim_env.last()
+        if not done:
+            legal_actions = sim_env.legal_actions()
+            for a in legal_actions:
+                next_state = sim_env.peek(a)
+                node.children[a] = Node(next_state, -node.player)
+
+        # 3️⃣ Evaluation (value network)
+        if done:
+            value = reward
+        else:
+            x = encode_canonical(node.state, node.player)
+            value = value_net(x).item()
+
+        # 4️⃣ Backprop
+        for n in reversed(path):
+            n.N += 1
+            n.W += value
+            value = gamma * (-value)
+
+        node.N += 1
+        node.W += value
+
+    # 5️⃣ Action selection
+    best_action = max(root.children.items(), key=lambda kv: kv[1].N)[0]
+
+    return best_action
+
+
 class Memory:
-    def __init__(self, n_state: torch.Tensor, offset: int):
+    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int):
+        self.state = state
         self.n_state = n_state
         self.offset = offset
         pass
@@ -55,11 +122,13 @@ class Value(nn.Module):
         self.conv = nn.Sequential(*conv_layers).to(self.device)
         self.head = nn.Sequential(*fc_layers).to(self.device)
         all_params = list(self.conv.parameters()) + list(self.head.parameters())
-        pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(p.numel() for p in self.head.parameters())
+        pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(
+            p.numel() for p in self.head.parameters()
+        )
         print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
 
-    def forward(self, state: torch.Tensor) -> float:
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         conv = self.conv(state)
         mean = conv.mean(dim=(2, 3))
         fc = self.head(mean)
@@ -67,11 +136,29 @@ class Value(nn.Module):
 
     def get_losses(
         self,
-        next_states: torch.Tensor,
-        z: torch.Tensor,
+        memory: list[list[Memory]],
+        reward: float,
+        gamma: float
     ) -> torch.Tensor:
-        values = self.forward(next_states)
-        loss = F.mse_loss(values.squeeze(-1), z)
+        T = len(memory)
+        vs = []
+        targets=[]
+        for i in reversed(range(T)):
+            frames = memory[i]
+            s = torch.stack([f.state for f in frames])
+            v = self.forward(s).squeeze(-1)
+            vs.append(v)
+            ns = torch.stack([f.n_state for f in frames])
+            if i == T-1:
+                target = torch.ones(len(frames)) * reward
+            else:
+                target = self.forward(ns).squeeze(-1) * gamma
+            target = target * frames[0].offset
+            targets.append(target)
+
+        vs = torch.cat(vs)
+        targets = torch.cat(targets)
+        loss = F.mse_loss(vs, targets, reduction="mean")
         return loss
 
     def update_parameters(self, loss: torch.Tensor) -> None:
@@ -264,8 +351,9 @@ class Game:
         #     print()
 
 
-EPISODE = 5000000
+EPISODE = 1000
 LR = 3e-4  # plus stable
+GAMMA = 0.99
 
 model = Value(
     device=device,
@@ -288,6 +376,7 @@ def cannonical_state(state) -> torch.Tensor:
     # x = x[0, :, :].flatten() + x[1, :, :].flatten() * -1
     return x
 
+
 def temperature(episode):
     if episode < 20_000:
         return 1.0
@@ -295,6 +384,7 @@ def temperature(episode):
         return 0.5
     else:
         return 0.25
+
 
 def select_action_by_value(state, mask, debug=False, train=False, temp=1.0):
     best_v = -1e9
@@ -396,19 +486,22 @@ def augment_d4(memory: Memory) -> list[Memory]:
     """
     Retourne une liste de Memory
     """
+    s0 = memory.state
     s1 = memory.n_state
     offset = memory.offset
     memories = []
 
     for k in range(4):
         # --- rotation ---
+        s_rot = rotate_grid(s0, k)
         ns_rot = rotate_grid(s1, k)
 
-        memories.append(Memory(n_state=ns_rot.to(device), offset=offset))
+        memories.append(Memory(state=s_rot, n_state=ns_rot.to(device), offset=offset))
 
+        s_m = mirror_grid(s_rot)
         ns_m = mirror_grid(ns_rot)
 
-        memories.append(Memory(n_state=ns_m.to(device), offset=offset))
+        memories.append(Memory(state=s_m, n_state=ns_m.to(device), offset=offset))
 
     # memories.append(memory)
     return memories
@@ -426,15 +519,19 @@ for i in range(EPISODE):
         fun = model
         s, status, mask = env.state(player if me else (3 - player))
         temp = temperature(i)
-        a = select_action_by_value( state=s, mask=mask, train=True, temp=temp)
+        a = select_action_by_value(state=s, mask=mask, train=True, temp=temp)
         env.step(a, player if me else (3 - player))
-        s, status, mask = env.state(player if me else (3 - player))
+        ns, status, mask = env.state(player if me else (3 - player))
         me = not me
         done = status != Status.PENDING
-        frame = Memory(n_state=cannonical_state(s), offset=1 if me else -1)
+        frame = Memory(
+            state=cannonical_state(s),
+            n_state=cannonical_state(ns),
+            offset=1 if me else -1,
+        )
         frames = augment_d4(frame)
         for frames_index in range(len(frames)):
-            memory.append(frames[frames_index])
+            memory.append(frames)
 
     # final reward to last move of player 1
     reward = 1.0 if (status == Status.P1) else (-1 if (status == Status.P2) else 0)
@@ -442,17 +539,12 @@ for i in range(EPISODE):
     first_player_deuces.append(1 if reward == 0 else 0)
     first_player_win.append(1 if reward == 1 else 0)
 
-    states = [m.n_state for m in memory]
-    z = [m.offset * reward for m in memory]
-    states = torch.stack(states, dim=0)
-    z = torch.Tensor(z)
-
-    loss = model.get_losses(next_states=states, z=z)
+    loss = model.get_losses(memory=memory, reward=reward, gamma=GAMMA)
     model.update_parameters(loss)
 
     learning_losses.append(loss.detach().cpu().numpy())
 
-    if i > 0 and i%500==0:
+    if i > 0 and i % 500 == 0:
         torch.save(model.conv.state_dict(), f"./conv-{i}.pth")
         torch.save(model.head.state_dict(), f"./head-{i}.pth")
 
