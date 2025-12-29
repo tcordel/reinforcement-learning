@@ -58,22 +58,22 @@ class Value(nn.Module):
     ) -> torch.Tensor:
         T = len(memory)
         vs = []
-        targets = []
+        targets = np.zeros(T)
+        R = reward
         for i in reversed(range(T)):
             frame = memory[i]
-            s = frame.state
-            v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
-            vs.append(v)
+            # s = frame.state
+            # v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
+            # vs.append(v)
             ns = frame.n_state
-            if i == T - 1:
-                target = torch.ones(len(frames)) * reward
-            else:
-                target = self.forward(ns.unsqueeze(dim=0)).squeeze(-1) * gamma
-            target = target * frames[0].offset
-            targets.append(target)
+            v = self.forward(ns.unsqueeze(dim=0)).squeeze(-1)
+            vs.append(v)
+            if i != T - 1:
+                R = gamma * R
+            targets[i] = R * frame.offset
 
         vs = torch.cat(vs)
-        targets = torch.cat(targets)
+        targets = torch.tensor(targets, dtype=torch.float)
         loss = F.mse_loss(vs, targets, reduction="mean")
         return loss
 
@@ -90,9 +90,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 1000
-LR = 1e-2  # plus stable
-GAMMA = 0.99
+EPISODE = 2000
+LR = 1e-3  # plus stable
+GAMMA = 0.9
 
 model = Value(
     device=device,
@@ -296,9 +296,10 @@ for i in range(EPISODE):
             frame = Memory(
                 state=state, n_state=x, offset=1 if agent == "player_1" else -1
             )
-            frames = augment_d4(frame)
-            for frames_index in range(len(frames)):
-                memory.append(frames[frames_index])
+            memory.append(frame)
+            # frames = augment_d4(frame)
+            # for frames_index in range(len(frames)):
+            #     memory.append(frames[frames_index])
 
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
@@ -370,7 +371,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 player = None
 while True:
     env_manual.reset(seed=42)
-    player = "player_2" if player is None or player == "player_1" else "player_1"
+    player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env_manual.agent_iter():
         observation, reward, termination, truncation, info = env_manual.last()
 
