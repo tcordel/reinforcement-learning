@@ -28,6 +28,8 @@ class Value(nn.Module):
         super().__init__()
         self.device = device
         self.n_envs = n_envs
+        self.optim_ctr = 0
+        self.update_target = 100
 
         conv_layers = [
             nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, padding=1),
@@ -40,17 +42,26 @@ class Value(nn.Module):
         # define actor and critic networks
         self.conv = nn.Sequential(*conv_layers).to(self.device)
         self.head = nn.Sequential(*fc_layers).to(self.device)
+        self.conv_target = nn.Sequential(*conv_layers).to(self.device)
+        self.head_target = nn.Sequential(*fc_layers).to(self.device)
         all_params = list(self.conv.parameters()) + list(self.head.parameters())
         pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(
             p.numel() for p in self.head.parameters()
         )
         print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
+        self.flush_target()
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        conv = self.conv(state)
+    def flush_target(self):
+        self.conv_target.load_state_dict(self.conv.state_dict())
+        self.head_target.load_state_dict(self.head.state_dict())
+
+    def forward(self, state: torch.Tensor, use_target=False) -> torch.Tensor:
+        conv_model = self.conv_target if use_target else self.conv
+        head_model = self.head_target if use_target else self.head
+        conv = conv_model(state)
         mean = conv.mean(dim=(2, 3))
-        fc = self.head(mean)
+        fc = head_model(mean)
         return fc
 
     def get_losses(
@@ -65,10 +76,11 @@ class Value(nn.Module):
             v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
             vs.append(v)
             if i == T - 1:
-                target = reward * frame.offset
+                target = reward
             else:
-                ns = frame.n_state
-                target = self.forward(ns.unsqueeze(dim=0)).item() * gamma
+                target = -gamma * target
+                # ns = frame.n_state
+                # target = -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
             targets[i] = target
 
         vs = torch.cat(vs)
@@ -80,6 +92,12 @@ class Value(nn.Module):
         self.optim.zero_grad()
         loss.backward()
         self.optim.step()
+        self.optim_ctr += 1
+        if self.optim_ctr >= self.update_target:
+            print("Flush target")
+            self.optim_ctr = 0
+            self.flush_target()
+
 
 
 if torch.cuda.is_available():
@@ -89,9 +107,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 2500
-LR = 1e-3  # plus stable
-GAMMA = 0.9
+EPISODE = 5000
+LR = 1e-4  # plus stable
+GAMMA = 0.99
 
 model = Value(
     device=device,
@@ -117,7 +135,7 @@ def cannonical_state(s):
     return x
 
 
-def select_action_by_value(env, debug=False, train=False, temp=1.0):
+def select_action_by_value(env, debug=False, train=False, temp=1.0, target= False):
     best_v = -1e9
     best_a = None
     observation, _, _, _, _ = env.last()
@@ -135,9 +153,9 @@ def select_action_by_value(env, debug=False, train=False, temp=1.0):
         slots = torch.where(state[0][a] + state[1][a] == 0)[0]
         column = slots[slots.size()[0] - 1]
         state[0, a, column] = 1
-
+        next_state = torch.stack([state[1], state[0]], dim=0)
         with torch.no_grad():
-            v = model(state.unsqueeze(dim=0))
+            v = -model(next_state.unsqueeze(dim=0), target)
 
         values.append(v.item())
         actions.append(a.item())
@@ -258,6 +276,7 @@ def augment_d4(memory: Memory) -> list[Memory]:
     memories.append(memory)
     return memories
 
+player = None
 
 for i in range(EPISODE):
     if i > 0 and i % 50 == 0:
@@ -273,8 +292,8 @@ for i in range(EPISODE):
         if termination or truncation:
             action = None
             if agent == "player_1":
-                # game_p1_reward = 0.1 if reward == 0 else reward
-                game_p1_reward = reward
+                game_p1_reward = 0.1 if reward == 0 else reward
+                # game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
@@ -284,10 +303,10 @@ for i in range(EPISODE):
             state = observation["observation"]
             state = cannonical_state(state)
             action = select_action_by_value(
-                env, train=True, temp=0.5 if i < 1000 else 0.1
+                env, train=True, temp=0.5 if i < 1000 else 0.1, target = agent != player
             )
             env.step(action)
-            observation = env.observe(agent)
+            observation, reward, termination, truncation, info = env.last()
             nstate = observation["observation"]
             mask = observation["action_mask"]
             mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
