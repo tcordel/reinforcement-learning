@@ -82,8 +82,8 @@ class Value(nn.Module):
             else:
                 # target = -gamma * target
                 ns = frame.n_state
-                target = self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
-            targets[i] = target * frame.offset
+                target = -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
+            targets[i] = target 
 
         vs = torch.cat(vs)
         targets = torch.tensor(targets, dtype=torch.float)
