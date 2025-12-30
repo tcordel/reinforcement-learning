@@ -11,13 +11,12 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state, n_state, reward, log_prob, offset, done, entropy):
+    def __init__(self, state, log_prob, entropy):
         self.state = state
-        self.n_state = n_state
-        self.reward = reward
+        self.n_state = state
+        self.reward = 0.
         self.log_prob = log_prob
-        self.offset = offset
-        self.done = done
+        self.done = False
         self.entropy = entropy
 
 
@@ -38,7 +37,9 @@ class A2C(nn.Module):
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(),
         ]
-        fc_layers = [nn.Linear(32, 64), nn.ReLU()]
+        fc_layers = [nn.Linear(32, 64), 
+                     nn.LayerNorm(64),
+                     nn.ReLU()]
         critic_layer = [nn.Linear(64, 1)]
         actor_layer = [
             nn.Linear(64, 7),
@@ -94,13 +95,14 @@ class A2C(nn.Module):
             entropy += m.entropy
         mean_entropy = entropy / len(memory)
         mean_actor_loss = actor_loss / len(memory)
-        actor_loss_kl =  mean_actor_loss + ENTROPY * mean_entropy
+        actor_loss_kl =  mean_actor_loss - ENTROPY * mean_entropy
         return actor_loss_kl, critic_loss / len(memory)
 
     def update_parameters(self, actor_loss, critic_loss) -> None:
         self.optim.zero_grad()
         loss = actor_loss + critic_loss * VF_COEFF
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         self.optim.step()
 
 
@@ -111,10 +113,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 1000
+EPISODE = 1500
 LR = 1e-4  # plus stable
-GAMMA = 1
-ENTROPY = 1e-2
+GAMMA = 0.99
+ENTROPY = 1e-3
 VF_COEFF = 0.8
 
 model = A2C(
@@ -134,8 +136,6 @@ first_player_deuces = []
 
 change_level_episode = []
 
-softmax = nn.Softmax(dim=0)
-
 
 def cannonical_state(s):
     x = torch.Tensor(s).to(device)
@@ -152,7 +152,7 @@ def select_action_by_value(env, debug=False, train=False, temp=1.0, target=False
     mask = torch.tensor(mask, device=device).bool()
     logits = model(x.unsqueeze(dim=0)).squeeze(0)
     logits[~mask] = -1e9
-    probs = F.softmax(logits/temp, dim=0)
+    probs = F.softmax(logits/temp, dim=-1)
 
     if train:
         dist = torch.distributions.Categorical(probs)
@@ -283,6 +283,7 @@ for i in range(EPISODE):
 
     memory = []
     player = "player_0" if player is None or player == "player_1" else "player_1"
+    frame = None
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
 
@@ -292,33 +293,29 @@ for i in range(EPISODE):
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
+                if frame is not None:
+                    frame.done = True
+                    frame.reward = reward
+                    memory.append(frame)
 
             env.step(action)
         else:
             state = observation["observation"]
             state = cannonical_state(state)
+            if frame is not None and agent == player:
+                frame.n_state = state
+                memory.append(frame)
             action, logprobs, entropy = select_action_by_value(
                 env, train=True, temp=temperature, target=agent != player
             )
             env.step(action)
-            observation, reward_next, termination, truncation, info = env.last()
-            nstate = observation["observation"]
-            x = cannonical_state(nstate)
-            done = termination or truncation
 
-            # Reward pour l'agent qui vient d'agir (zéro-somme): s'il y a fin, c'est l'opposé du reward de l'autre
-            reward_for_actor = -reward_next if done else 0.0
-
-            frame = Memory(
-                state=state,
-                n_state=x,
-                offset=None,
-                log_prob=logprobs,
-                reward=reward_for_actor,
-                done=done,
-                entropy=entropy
-            )
-            memory.append(frame)
+            if agent == player:
+                frame = Memory(
+                    state=state,
+                    log_prob=logprobs,
+                    entropy=entropy
+                )
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
