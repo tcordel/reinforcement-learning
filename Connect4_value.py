@@ -11,11 +11,12 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int, reward):
+    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int, reward, done):
         self.state = state
         self.n_state = n_state
         self.offset = offset
         self.reward = reward
+        self.done = done
         pass
 
 
@@ -79,7 +80,7 @@ class Value(nn.Module):
             v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
             vs.append(v)
             target = frame.reward
-            if i < T - 1:
+            if not frame.done:
                 ns = frame.n_state
                 target += -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
             targets[i] = target 
@@ -108,7 +109,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 2000
+EPISODE = 5000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
 
@@ -252,30 +253,13 @@ def mirror_mask(mask):
     return mirror_grid(mask.view(3, 3)).flatten()
 
 
-def augment_d4(memory: Memory) -> list[Memory]:
-    """
-    Retourne une liste de Memory
-    """
-    # s0 = memory.state
-    # s1 = memory.n_state
-    # offset = memory.offset
-    memories = []
-    #
-    # # vue canonique
-    # s1 = s1.view(3, 3)
-    #
-    # for k in range(4):
-    #     # --- rotation ---
-    #     ns_rot = rotate_grid(s1, k)
-    #
-    #     memories.append(Memory(n_state=ns_rot.flatten().to(device), offset=offset))
-    #
-    #     ns_m = mirror_grid(ns_rot)
-    #
-    #     memories.append(Memory(n_state=ns_m.flatten().to(device), offset=offset))
-    #
-    memories.append(memory)
-    return memories
+def augment_sim(memory: Memory) -> Memory:
+    s0 = memory.state
+    s1 = memory.n_state
+    s0p = torch.flip(input=s0, dims=[1])
+    s1p = torch.flip(input=s1, dims=[1])
+
+    return Memory(state=s0p, n_state=s1p, done=memory.done, reward=memory.reward, offset=memory.offset)
 
 player = None
 
@@ -286,6 +270,7 @@ for i in range(EPISODE):
     env.reset(seed=42)
 
     memory = []
+    temperature = 0.1 + 0.4 * (max(0, EPISODE-2*i)/EPISODE)
     player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
@@ -303,7 +288,7 @@ for i in range(EPISODE):
             state = observation["observation"]
             state = cannonical_state(state)
             action = select_action_by_value(
-                env, train=True, temp=0.5 if i < 1000 else 0.1, target = agent != player
+                env, train=True, temp=temperature, target = agent != player
             )
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
@@ -311,9 +296,10 @@ for i in range(EPISODE):
             x = cannonical_state(nstate)
 
             frame = Memory(
-                state=state, n_state=x, offset=1 if agent == player else -1, reward=-reward
+                state=state, n_state=x, offset=1 if agent == player else -1, reward=-reward, done = termination or truncation
             )
             memory.append(frame)
+            memory.append(augment_sim(frame))
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
