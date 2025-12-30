@@ -1,4 +1,3 @@
-from typing import Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -113,7 +112,7 @@ env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
 EPISODE = 1000
-LR = 1e-3  # plus stable
+LR = 1e-4  # plus stable
 GAMMA = 1
 ENTROPY = 1e-2
 VF_COEFF = 0.8
@@ -124,6 +123,7 @@ model = A2C(
     n_envs=1,
 )
 
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
 rolling_length = 20
 actor_learning_losses = []
