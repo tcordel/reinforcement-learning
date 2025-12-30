@@ -1,4 +1,3 @@
-from typing import Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -12,16 +11,14 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state, n_state, reward, log_prob, offset, done):
+    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int):
         self.state = state
         self.n_state = n_state
-        self.reward = reward
-        self.log_prob = log_prob
         self.offset = offset
-        self.done = done
+        pass
 
 
-class A2C(nn.Module):
+class Value(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -31,6 +28,8 @@ class A2C(nn.Module):
         super().__init__()
         self.device = device
         self.n_envs = n_envs
+        self.optim_ctr = 0
+        self.update_target = 100
 
         conv_layers = [
             nn.Conv2d(in_channels=2, out_channels=16, kernel_size=3, padding=1),
@@ -38,67 +37,69 @@ class A2C(nn.Module):
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(),
         ]
-        fc_layers = [nn.Linear(32, 64), nn.ReLU()]
-        critic_layer = [nn.Linear(64, 1)]
-        actor_layer = [
-            nn.Linear(64, 7),
-        ]
+        fc_layers = [nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1)]
 
         # define actor and critic networks
         self.conv = nn.Sequential(*conv_layers).to(self.device)
-        self.fc = nn.Sequential(*fc_layers).to(self.device)
-        self.critic_model = nn.Sequential(*critic_layer).to(self.device)
-        self.actor = nn.Sequential(*actor_layer).to(self.device)
-        all_params = (
-            list(self.conv.parameters())
-            + list(self.fc.parameters())
-            + list(self.critic_model.parameters())
-            + list(self.actor.parameters())
+        self.head = nn.Sequential(*fc_layers).to(self.device)
+        self.conv_target = nn.Sequential(*conv_layers).to(self.device)
+        self.head_target = nn.Sequential(*fc_layers).to(self.device)
+        all_params = list(self.conv.parameters()) + list(self.head.parameters())
+        pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(
+            p.numel() for p in self.head.parameters()
         )
-        # pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(
-        #     p.numel() for p in self.head.parameters()
-        # )
-        # print(f"Number of parameters -> {pytorch_total_params}")
+        print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
+        self.flush_target()
 
-    def backbone(self, state: torch.Tensor) -> torch.Tensor:
-        conv = self.conv(state)
+    def flush_target(self):
+        self.conv_target.load_state_dict(self.conv.state_dict())
+        self.head_target.load_state_dict(self.head.state_dict())
+
+    def forward(self, state: torch.Tensor, use_target=False) -> torch.Tensor:
+        conv_model = self.conv_target if use_target else self.conv
+        head_model = self.head_target if use_target else self.head
+        # conv_model = self.conv
+        # head_model = self.head
+        conv = conv_model(state)
         mean = conv.mean(dim=(2, 3))
-        fc = self.fc(mean)
+        fc = head_model(mean)
         return fc
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        logits = self.actor(self.backbone(state))
-        return logits
+    def get_losses(
+        self, memory: list[Memory], reward: float, gamma: float
+    ) -> torch.Tensor:
+        T = len(memory)
+        vs = []
+        targets = np.zeros(T)
+        for i in reversed(range(T)):
+            frame = memory[i]
+            s = frame.state
+            v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
+            vs.append(v)
+            if i == T - 1:
+                target = reward * frame.offset # le reward correspond à la récompense du joueur qui a le modèle non target. Desfois c'est l'adversaire qui termine et qui gagne, la target doit donc être adaptée.
+            else:
+                # target = -gamma * target
+                ns = frame.n_state
+                target = self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
+            targets[i] = target 
 
-    def critic(self, state: torch.Tensor) -> torch.Tensor:
-        value = self.critic_model(self.backbone(state))
-        return value
+        vs = torch.cat(vs)
+        targets = torch.tensor(targets, dtype=torch.float)
+        loss = F.mse_loss(vs, targets, reduction="mean")
+        return loss
 
-    def get_losses(self, memory: list[Memory], reward: float, gamma: float):
-        actor_loss = 0
-        critic_loss = 0
-        for m in memory:
-            v = self.critic(m.state.unsqueeze(0)).squeeze()
-            with torch.no_grad():
-                nv = (
-                    self.critic(m.n_state.unsqueeze(0)).squeeze()
-                    if not m.done
-                    else torch.tensor(0.0, device=self.device)
-                )
-                r = reward * m.offset if m.done else 0
-                target = r + gamma * nv
-                advantage = target - v
-
-            critic_loss += (v - target.detach()).pow(2)
-            actor_loss += -m.log_prob * advantage.detach()
-        return actor_loss / len(memory), critic_loss / len(memory)
-
-    def update_parameters(self, actor_loss, critic_loss) -> None:
+    def update_parameters(self, loss: torch.Tensor) -> None:
         self.optim.zero_grad()
-        loss = actor_loss + critic_loss * VF_COEFF
         loss.backward()
         self.optim.step()
+        self.optim_ctr += 1
+        if self.optim_ctr >= self.update_target:
+            print("Flush target")
+            self.optim_ctr = 0
+            self.flush_target()
+
 
 
 if torch.cuda.is_available():
@@ -108,12 +109,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 10000
+EPISODE = 1000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
-VF_COEFF = 0.8
 
-model = A2C(
+model = Value(
     device=device,
     lr=LR,
     n_envs=1,
@@ -121,8 +121,7 @@ model = A2C(
 
 
 rolling_length = 20
-actor_learning_losses = []
-critic_learning_losses = []
+learning_losses = []
 first_player_win = []
 first_player_losses = []
 first_player_deuces = []
@@ -138,26 +137,41 @@ def cannonical_state(s):
     return x
 
 
-def select_action_by_value(env, debug=False, train=False, temp=1.0, target=False):
+def select_action_by_value(env, debug=False, train=False, temp=1.0, target= False):
+    best_v = -1e9
+    best_a = None
     observation, _, _, _, _ = env.last()
     s = observation["observation"]
     x = cannonical_state(s)
 
     mask = observation["action_mask"]
-    mask = torch.tensor(mask, device=device).bool()
-    logits = model(x.unsqueeze(dim=0)).squeeze(0)
-    logits[~mask] = -1e9
-    probs = F.softmax(logits, dim=0)
+    mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
+
+    values = []
+    actions = []
+    for a in torch.where(mask_values)[0]:
+        state = x.detach().clone()
+
+        slots = torch.where(state[0][a] + state[1][a] == 0)[0]
+        column = slots[slots.size()[0] - 1]
+        state[0, a, column] = 1
+        next_state = torch.stack([state[1], state[0]], dim=0)
+        with torch.no_grad():
+            v = -model(next_state.unsqueeze(dim=0), target)
+
+        values.append(v.item())
+        actions.append(a.item())
+        if debug:
+            print(f"{a} -> {v}")
+        if v > best_v:
+            best_v = v
+            best_a = a.item()
 
     if train:
-        dist = torch.distributions.Categorical(probs / temp)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+        probs = softmax(torch.Tensor(values).to(device) / temp).detach().cpu().numpy()
+        return np.random.choice(actions, p=probs)
     else:
-        action = torch.argmax(probs)
-        log_prob = None
-
-    return action.item(), log_prob
+        return best_a
 
 
 def mesure():
@@ -183,7 +197,7 @@ def mesure():
                     else:
                         l_loss += 1
             else:
-                action, _ = select_action_by_value(env, i == 0 and first_play)
+                action = select_action_by_value(env, i == 0 and first_play)
 
             env.step(action)
             first_play = False
@@ -264,7 +278,6 @@ def augment_d4(memory: Memory) -> list[Memory]:
     memories.append(memory)
     return memories
 
-
 player = None
 
 for i in range(EPISODE):
@@ -274,6 +287,7 @@ for i in range(EPISODE):
     env.reset(seed=42)
 
     memory = []
+    game_p1_reward = 0
     player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
@@ -281,6 +295,7 @@ for i in range(EPISODE):
         if termination or truncation:
             action = None
             if agent == player:
+                # game_p1_reward = 0.1 if reward == 0 else reward
                 game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
@@ -290,22 +305,16 @@ for i in range(EPISODE):
         else:
             state = observation["observation"]
             state = cannonical_state(state)
-            action, logprobs = select_action_by_value(
-                env, train=True, temp=0.5 if i < 2000 else 0.1, target=agent != player
+            action = select_action_by_value(
+                env, train=True, temp=0.5 if i < 1000 else 0.1, target = agent != player
             )
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
             nstate = observation["observation"]
             x = cannonical_state(nstate)
 
-            offset = 1 if agent == player else -1
             frame = Memory(
-                state=state,
-                n_state=x,
-                offset=offset,
-                log_prob=logprobs,
-                reward=reward,
-                done=termination or truncation,
+                state=state, n_state=x, offset=1 if agent == player else -1
             )
             memory.append(frame)
             # frames = augment_d4(frame)
@@ -315,21 +324,19 @@ for i in range(EPISODE):
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
 
-    actor_loss, critic_loss = model.get_losses(memory=memory, gamma=GAMMA, reward=game_p1_reward)
-    model.update_parameters(actor_loss, critic_loss)
+    loss = model.get_losses(memory=memory, reward=game_p1_reward, gamma=GAMMA)
+    model.update_parameters(loss)
 
-    actor_learning_losses.append(actor_loss.detach().cpu().numpy())
-    critic_learning_losses.append(critic_loss.detach().cpu().numpy())
+    learning_losses.append(loss.detach().cpu().numpy())
 
     if i > rolling_length:
         writer.add_scalar("Wins", np.mean(first_player_win[-100:]), i)
         writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), i)
         writer.add_scalar("Deuces", np.mean(first_player_deuces[-100:]), i)
-        writer.add_scalar("actor_loss", np.mean(actor_learning_losses[-100:]), i)
-        writer.add_scalar("critic_loss", np.mean(critic_learning_losses[-100:]), i)
+        writer.add_scalar("mse_loss", np.mean(learning_losses[-100:]), i)
 
 
-fig, axs = plt.subplots(nrows=3, ncols=1, figsize=(12, 5))
+fig, axs = plt.subplots(nrows=2, ncols=1, figsize=(12, 5))
 fig.suptitle("Training plots for A2C in the TicTacToe environment")
 
 # entropy
@@ -361,28 +368,19 @@ if len(first_player_deuces) > 0:
 #     axs[0][0].vlines(i, 0, 1)
 # axs[0][0].plot(deuces_moving_average)
 # axs[0][0].plot(losses_moving_average)
+axs[0].set_xlabel("Number of updates")
 axs[0].legend()
 #  loss
-axs[1].set_title("Critic loss")
+axs[1].set_title("Loss")
 critic_losses_moving_average = (
     np.convolve(
-        np.array(critic_learning_losses).flatten(),
-        np.ones(rolling_length),
-        mode="valid",
+        np.array(learning_losses).flatten(), np.ones(rolling_length), mode="valid"
     )
     / rolling_length
 )
 axs[1].plot(critic_losses_moving_average)
+axs[1].set_xlabel("Number of updates")
 
-#  loss
-axs[2].set_title("Actor loss")
-actor_losses_moving_average = (
-    np.convolve(
-        np.array(actor_learning_losses).flatten(), np.ones(rolling_length), mode="valid"
-    )
-    / rolling_length
-)
-axs[2].plot(actor_losses_moving_average)
 
 plt.tight_layout()
 plt.show(block=False)
@@ -402,7 +400,7 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action, _ = select_action_by_value(env_manual)
+                action = select_action_by_value(env_manual)
             else:
                 print("Pick action")
                 action = input()
