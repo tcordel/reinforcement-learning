@@ -82,17 +82,23 @@ class A2C(nn.Module):
         entropy = 0
         for m in memory:
             v = self.critic(m.state.unsqueeze(0)).squeeze()
-            with torch.no_grad():
-                nv = (
-                    self.critic(m.n_state.unsqueeze(0)).squeeze()
-                    if not m.done
-                    else torch.tensor(0.0, device=self.device)
-                )
-                target = m.reward + gamma * (-nv)
+            # with torch.no_grad():
+            #     nv = (
+            #         self.critic(m.n_state.unsqueeze(0)).squeeze()
+            #         if not m.done
+            #         else torch.tensor(0.0, device=self.device)
+            #     )
+            #     target = m.reward + gamma * (-nv)
+            target = torch.tensor(m.reward, device=self.device)
             advantage = (target - v).detach()
             actor_loss += -m.log_prob * advantage
             critic_loss += F.mse_loss(v, target.detach())
             entropy += m.entropy
+            # print(
+            #     m.reward,
+            #     v.item(),
+            #     (target - v).item()
+            # )
         mean_entropy = entropy / len(memory)
         mean_actor_loss = actor_loss / len(memory)
         actor_loss_kl =  mean_actor_loss - ENTROPY * mean_entropy
@@ -113,7 +119,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 1500
+EPISODE = 5000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
 ENTROPY = 1e-3
@@ -279,7 +285,7 @@ for i in range(EPISODE):
         print(i)
 
     env.reset()
-    temperature = 0.1 + 0.4 * (max(0, EPISODE-3*i)/EPISODE)
+    temperature = 0.1 + 0.4 * (max(0, EPISODE-5*i)/EPISODE)
 
     memory = []
     player = "player_0" if player is None or player == "player_1" else "player_1"
@@ -320,6 +326,10 @@ for i in range(EPISODE):
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
 
+    R = 0
+    for m in reversed(memory):
+        R = m.reward + GAMMA * R
+        m.reward = R
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
 
