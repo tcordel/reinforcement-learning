@@ -130,8 +130,13 @@ model = A2C(
     lr=LR,
     n_envs=1,
 )
+target = A2C(
+    device=device,
+    lr=LR,
+    n_envs=1,
+)
+target.load_state_dict(model.state_dict())
 
-torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
 rolling_length = 20
 actor_learning_losses = []
@@ -149,14 +154,14 @@ def cannonical_state(s):
     return x
 
 
-def select_action_by_value(env, debug=False, train=False, temp=1.0, target=False):
+def select_action_by_value(env, agent, debug=False, train=False, temp=1.0, target=False):
     observation, _, _, _, _ = env.last()
     s = observation["observation"]
     x = cannonical_state(s)
 
     mask = observation["action_mask"]
     mask = torch.tensor(mask, device=device).bool()
-    logits = model(x.unsqueeze(dim=0)).squeeze(0)
+    logits = agent(x.unsqueeze(dim=0)).squeeze(0)
     logits[~mask] = -1e9
     probs = F.softmax(logits/temp, dim=-1)
 
@@ -196,7 +201,7 @@ def mesure():
                     else:
                         l_loss += 1
             else:
-                action, _, _ = select_action_by_value(env, i == 0 and first_play)
+                action, _, _ = select_action_by_value(env, model, i == 0 and first_play)
 
             env.step(action)
             first_play = False
@@ -311,8 +316,10 @@ for i in range(EPISODE):
             if frame is not None and agent == player:
                 frame.n_state = state
                 memory.append(frame)
+
+            agent_model = model if agent == player else target
             action, logprobs, entropy = select_action_by_value(
-                env, train=True, temp=temperature, target=agent != player
+                env, agent_model, train=True, temp=temperature, target=agent != player
             )
             env.step(action)
 
@@ -330,8 +337,6 @@ for i in range(EPISODE):
     for m in reversed(memory):
         R = m.reward + GAMMA * R
         m.reward = R
-    states = [m.n_state for m in memory]
-    states = torch.stack(states, dim=0)
 
     actor_loss, critic_loss = model.get_losses(memory=memory, gamma=GAMMA)
     model.update_parameters(actor_loss, critic_loss)
@@ -339,6 +344,8 @@ for i in range(EPISODE):
     actor_learning_losses.append(actor_loss.detach().cpu().numpy())
     critic_learning_losses.append(critic_loss.detach().cpu().numpy())
 
+    if i > 0 and i%100==0:
+        target.load_state_dict(model.state_dict())
     if i > rolling_length:
         writer.add_scalar("Wins", np.mean(first_player_win[-100:]), i)
         writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), i)
@@ -420,7 +427,7 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action, _, _ = select_action_by_value(env_manual)
+                action, _, _ = select_action_by_value(env_manual, model)
             else:
                 print("Pick action")
                 action = input()
