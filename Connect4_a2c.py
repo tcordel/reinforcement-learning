@@ -87,7 +87,7 @@ class A2C(nn.Module):
                     if not m.done
                     else torch.tensor(0.0, device=self.device)
                 )
-                target = m.reward + gamma * (-nv)
+                target = m.reward + gamma * (nv)
             # target = torch.tensor(m.reward, device=self.device)
             advantage = (target - v).detach()
             actor_loss += -m.log_prob * advantage
@@ -331,12 +331,6 @@ for i in range(EPISODE):
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
-
-    R = 0
-    for m in reversed(memory):
-        R = m.reward + GAMMA * R
-        m.reward = R
-
     actor_loss, critic_loss = model.get_losses(memory=memory, gamma=GAMMA)
     model.update_parameters(actor_loss, critic_loss)
 
