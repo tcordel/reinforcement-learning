@@ -12,13 +12,14 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state, n_state, reward, log_prob, offset, done):
+    def __init__(self, state, n_state, reward, log_prob, offset, done, entropy):
         self.state = state
         self.n_state = n_state
         self.reward = reward
         self.log_prob = log_prob
         self.offset = offset
         self.done = done
+        self.entropy = entropy
 
 
 class A2C(nn.Module):
@@ -51,9 +52,9 @@ class A2C(nn.Module):
         self.actor = nn.Sequential(*actor_layer).to(self.device)
         all_params = (
             list(self.conv.parameters())
-            + list(self.fc.parameters())
-            + list(self.critic_model.parameters())
-            + list(self.actor.parameters())
+                + list(self.fc.parameters())
+                + list(self.critic_model.parameters())
+                + list(self.actor.parameters())
         )
         # pytorch_total_params = sum(p.numel() for p in self.conv.parameters()) + sum(
         #     p.numel() for p in self.head.parameters()
@@ -75,9 +76,10 @@ class A2C(nn.Module):
         value = self.critic_model(self.backbone(state))
         return value
 
-    def get_losses(self, memory: list[Memory], reward: float, gamma: float):
+    def get_losses(self, memory: list[Memory], gamma: float):
         actor_loss = 0
         critic_loss = 0
+        entropy = 0
         for m in memory:
             v = self.critic(m.state.unsqueeze(0)).squeeze()
             with torch.no_grad():
@@ -86,13 +88,15 @@ class A2C(nn.Module):
                     if not m.done
                     else torch.tensor(0.0, device=self.device)
                 )
-                r = reward * m.offset if m.done else 0
-                target = r + gamma * nv
-                advantage = target - v
-
-            critic_loss += (v - target.detach()).pow(2)
-            actor_loss += -m.log_prob * advantage.detach()
-        return actor_loss / len(memory), critic_loss / len(memory)
+                target = m.reward + gamma * (-nv)
+            advantage = (target - v).detach()
+            actor_loss += -m.log_prob * advantage
+            critic_loss += F.mse_loss(v, target.detach())
+            entropy += m.entropy
+        mean_entropy = entropy / len(memory)
+        mean_actor_loss = actor_loss / len(memory)
+        actor_loss_kl =  mean_actor_loss + ENTROPY * mean_entropy
+        return actor_loss_kl, critic_loss / len(memory)
 
     def update_parameters(self, actor_loss, critic_loss) -> None:
         self.optim.zero_grad()
@@ -108,9 +112,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 10000
-LR = 1e-4  # plus stable
-GAMMA = 0.99
+EPISODE = 1000
+LR = 1e-3  # plus stable
+GAMMA = 1
+ENTROPY = 1e-2
 VF_COEFF = 0.8
 
 model = A2C(
@@ -147,17 +152,19 @@ def select_action_by_value(env, debug=False, train=False, temp=1.0, target=False
     mask = torch.tensor(mask, device=device).bool()
     logits = model(x.unsqueeze(dim=0)).squeeze(0)
     logits[~mask] = -1e9
-    probs = F.softmax(logits, dim=0)
+    probs = F.softmax(logits/temp, dim=0)
 
     if train:
-        dist = torch.distributions.Categorical(probs / temp)
+        dist = torch.distributions.Categorical(probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
     else:
         action = torch.argmax(probs)
         log_prob = None
+        entropy = None
 
-    return action.item(), log_prob
+    return action.item(), log_prob, entropy
 
 
 def mesure():
@@ -165,7 +172,7 @@ def mesure():
     l_deuce = 0
     l_loss = 0
     for i in range(1):
-        env.reset(seed=42)
+        env.reset()
         player = "player_0"
 
         first_play = True
@@ -183,7 +190,7 @@ def mesure():
                     else:
                         l_loss += 1
             else:
-                action, _ = select_action_by_value(env, i == 0 and first_play)
+                action, _, _ = select_action_by_value(env, i == 0 and first_play)
 
             env.step(action)
             first_play = False
@@ -268,10 +275,11 @@ def augment_d4(memory: Memory) -> list[Memory]:
 player = None
 
 for i in range(EPISODE):
-    if i > 0 and i % 50 == 0:
+    if i > 0 and i % 100 == 0:
         print(i)
 
-    env.reset(seed=42)
+    env.reset()
+    temperature = 0.1 + 0.4 * (max(0, EPISODE-3*i)/EPISODE)
 
     memory = []
     player = "player_0" if player is None or player == "player_1" else "player_1"
@@ -281,7 +289,6 @@ for i in range(EPISODE):
         if termination or truncation:
             action = None
             if agent == player:
-                game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
@@ -290,22 +297,26 @@ for i in range(EPISODE):
         else:
             state = observation["observation"]
             state = cannonical_state(state)
-            action, logprobs = select_action_by_value(
-                env, train=True, temp=0.5 if i < 2000 else 0.1, target=agent != player
+            action, logprobs, entropy = select_action_by_value(
+                env, train=True, temp=temperature, target=agent != player
             )
             env.step(action)
-            observation, reward, termination, truncation, info = env.last()
+            observation, reward_next, termination, truncation, info = env.last()
             nstate = observation["observation"]
             x = cannonical_state(nstate)
+            done = termination or truncation
 
-            offset = 1 if agent == player else -1
+            # Reward pour l'agent qui vient d'agir (zéro-somme): s'il y a fin, c'est l'opposé du reward de l'autre
+            reward_for_actor = -reward_next if done else 0.0
+
             frame = Memory(
                 state=state,
                 n_state=x,
-                offset=offset,
+                offset=None,
                 log_prob=logprobs,
-                reward=reward,
-                done=termination or truncation,
+                reward=reward_for_actor,
+                done=done,
+                entropy=entropy
             )
             memory.append(frame)
             # frames = augment_d4(frame)
@@ -315,7 +326,7 @@ for i in range(EPISODE):
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
 
-    actor_loss, critic_loss = model.get_losses(memory=memory, gamma=GAMMA, reward=game_p1_reward)
+    actor_loss, critic_loss = model.get_losses(memory=memory, gamma=GAMMA)
     model.update_parameters(actor_loss, critic_loss)
 
     actor_learning_losses.append(actor_loss.detach().cpu().numpy())
@@ -392,7 +403,7 @@ print(f"{i_win},{i_deuce},{i_loss}")
 
 player = None
 while True:
-    env_manual.reset(seed=42)
+    env_manual.reset()
     player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env_manual.agent_iter():
         observation, reward, termination, truncation, info = env_manual.last()
@@ -402,7 +413,7 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action, _ = select_action_by_value(env_manual)
+                action, _, _ = select_action_by_value(env_manual)
             else:
                 print("Pick action")
                 action = input()
