@@ -11,10 +11,11 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int):
+    def __init__(self, state: torch.Tensor, n_state: torch.Tensor, offset: int, reward):
         self.state = state
         self.n_state = n_state
         self.offset = offset
+        self.reward = reward
         pass
 
 
@@ -67,7 +68,7 @@ class Value(nn.Module):
         return fc
 
     def get_losses(
-        self, memory: list[Memory], reward: float, gamma: float
+        self, memory: list[Memory], gamma: float
     ) -> torch.Tensor:
         T = len(memory)
         vs = []
@@ -77,12 +78,10 @@ class Value(nn.Module):
             s = frame.state
             v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
             vs.append(v)
-            if i == T - 1:
-                target = reward * frame.offset # le reward correspond à la récompense du joueur qui a le modèle non target. Desfois c'est l'adversaire qui termine et qui gagne, la target doit donc être adaptée.
-            else:
-                # target = -gamma * target
+            target = frame.reward
+            if i < T - 1:
                 ns = frame.n_state
-                target = self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
+                target += -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
             targets[i] = target 
 
         vs = torch.cat(vs)
@@ -109,7 +108,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 1000
+EPISODE = 2000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
 
@@ -287,7 +286,6 @@ for i in range(EPISODE):
     env.reset(seed=42)
 
     memory = []
-    game_p1_reward = 0
     player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
@@ -296,7 +294,6 @@ for i in range(EPISODE):
             action = None
             if agent == player:
                 # game_p1_reward = 0.1 if reward == 0 else reward
-                game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
@@ -314,7 +311,7 @@ for i in range(EPISODE):
             x = cannonical_state(nstate)
 
             frame = Memory(
-                state=state, n_state=x, offset=1 if agent == player else -1
+                state=state, n_state=x, offset=1 if agent == player else -1, reward=-reward
             )
             memory.append(frame)
             # frames = augment_d4(frame)
@@ -324,7 +321,7 @@ for i in range(EPISODE):
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
 
-    loss = model.get_losses(memory=memory, reward=game_p1_reward, gamma=GAMMA)
+    loss = model.get_losses(memory=memory, gamma=GAMMA)
     model.update_parameters(loss)
 
     learning_losses.append(loss.detach().cpu().numpy())
@@ -403,8 +400,15 @@ while True:
                 action = select_action_by_value(env_manual)
             else:
                 print("Pick action")
-                action = input()
-                action = np.array(action, dtype=np.int16)
+                ok = False
+                while not ok:
+                    ok = True
+                    try:
+                        action = input()
+                        action = np.array(action, dtype=np.int16)
+                    except:
+                        ok = False
+                        
 
         env_manual.step(action)
 
