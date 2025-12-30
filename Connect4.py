@@ -78,11 +78,11 @@ class Value(nn.Module):
             v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
             vs.append(v)
             if i == T - 1:
-                target = reward
+                target = reward * frame.offset # le reward correspond à la récompense du joueur qui a le modèle non target. Desfois c'est l'adversaire qui termine et qui gagne, la target doit donc être adaptée.
             else:
                 # target = -gamma * target
                 ns = frame.n_state
-                target = -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
+                target = self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
             targets[i] = target 
 
         vs = torch.cat(vs)
@@ -109,7 +109,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 1000
+EPISODE = 10000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
 
