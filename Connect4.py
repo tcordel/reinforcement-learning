@@ -59,6 +59,8 @@ class Value(nn.Module):
     def forward(self, state: torch.Tensor, use_target=False) -> torch.Tensor:
         conv_model = self.conv_target if use_target else self.conv
         head_model = self.head_target if use_target else self.head
+        # conv_model = self.conv
+        # head_model = self.head
         conv = conv_model(state)
         mean = conv.mean(dim=(2, 3))
         fc = head_model(mean)
@@ -78,10 +80,10 @@ class Value(nn.Module):
             if i == T - 1:
                 target = reward
             else:
-                target = -gamma * target
-                # ns = frame.n_state
-                # target = -self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
-            targets[i] = target
+                # target = -gamma * target
+                ns = frame.n_state
+                target = self.forward(ns.unsqueeze(dim=0), use_target= True).item() * gamma
+            targets[i] = target * frame.offset
 
         vs = torch.cat(vs)
         targets = torch.tensor(targets, dtype=torch.float)
@@ -107,7 +109,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 5000
+EPISODE = 1000
 LR = 1e-4  # plus stable
 GAMMA = 0.99
 
@@ -118,7 +120,7 @@ model = Value(
 )
 
 
-rolling_length = 100
+rolling_length = 20
 learning_losses = []
 first_player_win = []
 first_player_losses = []
@@ -178,7 +180,7 @@ def mesure():
     l_loss = 0
     for i in range(1):
         env.reset(seed=42)
-        player = "player_1"
+        player = "player_0"
 
         first_play = True
         for agent in env.agent_iter():
@@ -286,14 +288,15 @@ for i in range(EPISODE):
 
     memory = []
     game_p1_reward = 0
+    player = "player_0" if player is None or player == "player_1" else "player_1"
     for agent in env.agent_iter():
         observation, reward, termination, truncation, info = env.last()
 
         if termination or truncation:
             action = None
-            if agent == "player_1":
-                game_p1_reward = 0.1 if reward == 0 else reward
-                # game_p1_reward = reward
+            if agent == player:
+                # game_p1_reward = 0.1 if reward == 0 else reward
+                game_p1_reward = reward
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
@@ -308,12 +311,10 @@ for i in range(EPISODE):
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
             nstate = observation["observation"]
-            mask = observation["action_mask"]
-            mask_values = torch.tensor(mask, dtype=torch.bool, device=device)
             x = cannonical_state(nstate)
 
             frame = Memory(
-                state=state, n_state=x, offset=1 if agent == "player_1" else -1
+                state=state, n_state=x, offset=1 if agent == player else -1
             )
             memory.append(frame)
             # frames = augment_d4(frame)
