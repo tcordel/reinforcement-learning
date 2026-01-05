@@ -292,6 +292,7 @@ for i in range(EPISODE):
             )
             env.step(action)
             observation, reward, termination, truncation, info = env.last()
+            env.observe(agent) # board as agent view
             nstate = observation["observation"]
             x = cannonical_state(nstate)
 
@@ -383,7 +384,7 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action = select_action_by_value(env_manual)
+                action = select_action_by_value(env_manual, debug=True)
             else:
                 print("Pick action")
                 ok = False
@@ -391,6 +392,8 @@ while True:
                     ok = True
                     try:
                         action = input()
+                        if action == 'q':
+                            break
                         action = np.array(action, dtype=np.int16)
                     except:
                         ok = False
