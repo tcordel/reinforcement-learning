@@ -5,10 +5,11 @@ import torch.nn as nn
 from pettingzoo.classic import connect_four_v3
 from torch.nn import functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
+import time
 
 # https://pettingzoo.farama.org/environments/classic/connect_four/
 writer = SummaryWriter()
-
+start = time.time()
 
 class Memory:
     def __init__(self, state, mask, n_state, reward, done, action):
@@ -49,15 +50,32 @@ class Policy(nn.Module):
         print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
 
+    def mirror_logits(self, logits):
+        # logits: (B, 7)
+        return logits.flip(dims=[1])
+
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        conv_model = self.conv
-        head_model = self.head
-        # conv_model = self.conv
-        # head_model = self.head
-        conv = conv_model(state)
+        # state: (B, C, H, W)
+        logits_list = []
+
+        # identité
+        conv = self.conv(state)
         mean = conv.mean(dim=(2, 3))
-        fc = head_model(mean)
-        return fc
+        logits = self.head(mean)
+        logits_list.append(logits)
+
+        # miroir horizontal
+        state_m = torch.flip(state, dims=[3])  # W
+        conv_m = self.conv(state_m)
+        mean_m = conv_m.mean(dim=(2, 3))
+        logits_m = self.head(mean_m)
+
+        # reprojection action → repère canonique
+        logits_m = self.mirror_logits(logits_m)
+        logits_list.append(logits_m)
+
+        # pooling équivariant
+        return torch.mean(torch.stack(logits_list, dim=0), dim=0)
 
     def get_losses(self, memory: list[Memory], critic: nn.Module, gamma, n_step=3):
         states = torch.stack([m.state for m in memory])
@@ -100,12 +118,11 @@ class Policy(nn.Module):
                     bootstrap_idx = last_idx + 1
                     if bootstrap_idx < T and not done[last_idx]:
                         G += discount * values[bootstrap_idx].item()
+                advantages[t] = G - values[t]
 
-        actor_losses = -log_probs * advantages
-        # mean_entropy = entropy / len(memory)
-        # mean_actor_loss = actor_loss / len(memory)
-        # actor_loss_kl = mean_actor_loss  # - ENTROPY * mean_entropy
-        return actor_losses.mean() - ENTROPY * entropies.mean()
+        actor_loss = -(log_probs * advantages.detach()).mean()
+        entropy_bonus = ENTROPY * entropies.mean()
+        return actor_loss - entropy_bonus
 
     def update_parameters(self, actor_loss) -> None:
         self.optim.zero_grad()
@@ -153,15 +170,25 @@ class Value(nn.Module):
         self.conv_target.load_state_dict(self.conv.state_dict())
         self.head_target.load_state_dict(self.head.state_dict())
 
+    def symmetries(self, state):
+        # state: (C, H, W)
+        return [
+            state,
+            torch.flip(state, dims=[2])  # miroir horizontal
+        ]
     def forward(self, state: torch.Tensor, use_target=False) -> torch.Tensor:
         conv_model = self.conv_target if use_target else self.conv
         head_model = self.head_target if use_target else self.head
-        # conv_model = self.conv
-        # head_model = self.head
-        conv = conv_model(state)
-        mean = conv.mean(dim=(2, 3))
-        fc = head_model(mean)
-        return fc
+        # state: (B, C, H, W)
+        values = []
+        for s in self.symmetries(state):
+            conv = conv_model(s)
+            mean = conv.mean(dim=(2, 3))
+            v = head_model(mean)
+            values.append(v)
+
+        # pooling de symétrie
+        return torch.mean(torch.stack(values, dim=0), dim=0)
 
     def get_losses(self, memory: list[Memory], gamma: float, n_step=3) -> torch.Tensor:
         T = len(memory)
@@ -226,7 +253,7 @@ env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
 EPISODE = 5000
-LR = 1e-5  # plus stable
+LR = 1e-4  # plus stable
 GAMMA = 0.9
 TD_N = 5
 ENTROPY = 1e-3
@@ -239,7 +266,7 @@ value = Value(
 )
 policy = Policy(
     device=device,
-    lr=LR * 10,
+    lr=LR,
     n_envs=1,
 )
 
@@ -369,22 +396,6 @@ def mirror_mask(mask):
     return mirror_grid(mask.view(3, 3)).flatten()
 
 
-def augment_sim(memory: Memory) -> Memory:
-    s0 = memory.state
-    s1 = memory.n_state
-    s0p = torch.flip(input=s0, dims=[1])
-    s1p = torch.flip(input=s1, dims=[1])
-
-    return Memory(
-        state=s0p,
-        n_state=s1p,
-        done=memory.done,
-        reward=memory.reward,
-        action=6 - memory.action,
-        mask=memory.mask.flip(0),
-    )
-
-
 player = None
 
 for i in range(EPISODE):
@@ -431,8 +442,6 @@ for i in range(EPISODE):
                 done=termination or truncation,
             )
             memory.append(frame)
-
-            # memory.append(augment_sim(frame))
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
@@ -516,6 +525,8 @@ plt.show(block=False)
 
 i_win, i_deuce, i_loss = mesure()
 print(f"{i_win},{i_deuce},{i_loss}")
+end = time.time()
+print(f"Elapsed {end - start}")
 
 player = None
 while True:
