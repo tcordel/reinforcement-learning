@@ -11,13 +11,13 @@ writer = SummaryWriter()
 
 
 class Memory:
-    def __init__(self, state, n_state, reward, done, log_prob, entropy):
+    def __init__(self, state, mask, n_state, reward, done, action):
         self.state = state
         self.n_state = n_state
         self.reward = reward
-        self.log_prob = log_prob
         self.done = done
-        self.entropy = entropy
+        self.action = action
+        self.mask = mask
 
 
 class Policy(nn.Module):
@@ -63,9 +63,20 @@ class Policy(nn.Module):
     def get_losses(self, memory: list[Memory], critic: nn.Module, gamma):
         states = torch.stack([m.state for m in memory])
         new_states = torch.stack([m.n_state for m in memory])
-        log_probs = torch.tensor([m.log_prob for m in memory], device=device)
-        values = critic(states, True).squeeze(-1)
-        n_values = -critic(new_states, True).squeeze(-1)
+        actions = torch.tensor([m.action for m in memory], device=device)
+        masks = torch.stack([m.mask for m in memory])
+
+        logits = policy(states).squeeze(0)
+        logits[~masks] = -1e9
+        probs = F.softmax(logits, dim=-1)
+
+        dist = torch.distributions.Categorical(probs)
+        log_probs = dist.log_prob(actions)
+        entropies = dist.entropy()
+
+        with torch.no_grad():
+            values = critic(states, True).squeeze(-1)
+            n_values = -critic(new_states, True).squeeze(-1)
         r = torch.tensor([m.reward for m in memory], device=device)
         advantages = r + gamma * n_values - values
 
@@ -73,13 +84,13 @@ class Policy(nn.Module):
         # mean_entropy = entropy / len(memory)
         # mean_actor_loss = actor_loss / len(memory)
         # actor_loss_kl = mean_actor_loss  # - ENTROPY * mean_entropy
-        return actor_losses.mean()
+        return actor_losses.mean() - ENTROPY * entropies.mean()
 
     def update_parameters(self, actor_loss) -> None:
         self.optim.zero_grad()
         loss = actor_loss
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
         self.optim.step()
 
 
@@ -171,9 +182,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 200
-LR = 1e-4  # plus stable
+EPISODE = 50000
+LR = 1e-5  # plus stable
 GAMMA = 0.99
+ENTROPY = 1e-3
 
 value = Value(
     device=device,
@@ -182,7 +194,7 @@ value = Value(
 )
 policy = Policy(
     device=device,
-    lr=LR * 10,
+    lr=LR,
     n_envs=1,
 )
 
@@ -225,14 +237,10 @@ def select_action_by_value(
     if train:
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
     else:
         action = torch.argmax(probs)
-        log_prob = None
-        entropy = None
 
-    return action.item(), log_prob, entropy
+    return action.item(), None, None
 
 
 def mesure():
@@ -316,28 +324,19 @@ def mirror_mask(mask):
     return mirror_grid(mask.view(3, 3)).flatten()
 
 
-def augment_sim(memory: Memory, mask, temp, action) -> Memory:
+def augment_sim(memory: Memory) -> Memory:
     s0 = memory.state
     s1 = memory.n_state
     s0p = torch.flip(input=s0, dims=[1])
     s1p = torch.flip(input=s1, dims=[1])
-    logits = policy(x.unsqueeze(dim=0)).squeeze(0)
-    mask_flipped = mask.flip(0)
-    logits[~mask_flipped] = -1e9
-    probs = F.softmax(logits / temp, dim=-1)
-
-    dist = torch.distributions.Categorical(probs)
-    action_reversed = torch.tensor([6 - action], dtype=torch.float, device=device)
-    log_prob = dist.log_prob(action_reversed)
-    entropy = dist.entropy()
 
     return Memory(
         state=s0p,
         n_state=s1p,
         done=memory.done,
         reward=memory.reward,
-        log_prob=log_prob,
-        entropy=entropy,
+        action=6 - memory.action,
+        mask=memory.mask.flip(0)
     )
 
 
@@ -382,14 +381,14 @@ for i in range(EPISODE):
                 state=state,
                 n_state=x,
                 reward=-reward,
+                action=action,
+                mask=mask,
                 done=termination or truncation,
-                log_prob=log_prob,
-                entropy=entropy,
             )
             memory.append(frame)
 
             memory.append(
-                augment_sim(frame, temp=temperature, mask=mask, action=action)
+                augment_sim(frame)
             )
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
@@ -485,7 +484,8 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action = select_action_by_value(env_manual, debug=True, agent=policy)
+                action, _, _ = select_action_by_value(env_manual, debug=True, agent=policy, train=False)
+            else:
                 ok = False
                 while not ok:
                     ok = True
