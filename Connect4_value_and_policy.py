@@ -49,10 +49,9 @@ class Policy(nn.Module):
         print(f"Number of parameters -> {pytorch_total_params}")
         self.optim = torch.optim.Adam(all_params, lr=lr)
 
-
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         conv_model = self.conv
-        head_model =self.head
+        head_model = self.head
         # conv_model = self.conv
         # head_model = self.head
         conv = conv_model(state)
@@ -60,25 +59,47 @@ class Policy(nn.Module):
         fc = head_model(mean)
         return fc
 
-    def get_losses(self, memory: list[Memory], critic: nn.Module, gamma):
+    def get_losses(self, memory: list[Memory], critic: nn.Module, gamma, n_step=3):
         states = torch.stack([m.state for m in memory])
-        new_states = torch.stack([m.n_state for m in memory])
+        T = len(states)
         actions = torch.tensor([m.action for m in memory], device=device)
         masks = torch.stack([m.mask for m in memory])
+        r = torch.tensor([m.reward for m in memory], device=device)
+        done = torch.tensor([m.done for m in memory], device=device).bool()
 
-        logits = policy(states).squeeze(0)
+        logits = self(states)
         logits[~masks] = -1e9
         probs = F.softmax(logits, dim=-1)
 
         dist = torch.distributions.Categorical(probs)
         log_probs = dist.log_prob(actions)
         entropies = dist.entropy()
+        advantages = torch.zeros(T, device=device)
 
         with torch.no_grad():
             values = critic(states, True).squeeze(-1)
-            n_values = -critic(new_states, True).squeeze(-1)
-        r = torch.tensor([m.reward for m in memory], device=device)
-        advantages = r + gamma * n_values - values
+            # n_values = -critic(new_states, True).squeeze(-1)
+            for t in range(T):
+                G = 0.0
+                discount = 1.0
+                last_idx = None
+
+                for k in range(n_step):
+                    idx = t + k
+                    if idx >= T:
+                        break
+
+                    G += discount * r[idx]
+                    discount *= -gamma
+                    last_idx = idx
+
+                    if done[idx]:
+                        break
+
+                if last_idx is not None:
+                    bootstrap_idx = last_idx + 1
+                    if bootstrap_idx < T and not done[last_idx]:
+                        G += discount * values[bootstrap_idx].item()
 
         actor_losses = -log_probs * advantages
         # mean_entropy = entropy / len(memory)
@@ -142,26 +163,48 @@ class Value(nn.Module):
         fc = head_model(mean)
         return fc
 
-    def get_losses(self, memory: list[Memory], gamma: float) -> torch.Tensor:
+    def get_losses(self, memory: list[Memory], gamma: float, n_step=3) -> torch.Tensor:
         T = len(memory)
-        vs = []
-        targets = np.zeros(T)
-        for i in reversed(range(T)):
-            frame = memory[i]
-            s = frame.state
-            v = self.forward(s.unsqueeze(dim=0)).squeeze(-1)
-            vs.append(v)
-            target = frame.reward
-            if not frame.done:
-                ns = frame.n_state
-                target += (
-                    -self.forward(ns.unsqueeze(dim=0), use_target=True).item() * gamma
-                )
-            targets[i] = target
+        states = torch.stack([m.state for m in memory]).to(self.device)
+        rewards = torch.tensor(
+            [m.reward for m in memory], device=self.device, dtype=torch.float
+        )
+        done = torch.tensor(
+            [m.done for m in memory], device=self.device, dtype=torch.bool
+        )
 
-        vs = torch.cat(vs)
-        targets = torch.tensor(targets, dtype=torch.float)
-        loss = F.mse_loss(vs, targets, reduction="mean")
+        with torch.no_grad():
+            values_target = self.forward(states, use_target=True).squeeze(-1)
+
+        targets = torch.zeros(T, device=self.device)
+
+        for t in range(T):
+            G = 0.0
+            discount = 1.0
+            last_idx = None
+
+            for k in range(n_step):
+                idx = t + k
+                if idx >= T:
+                    break
+
+                G += discount * rewards[idx]
+                discount *= -gamma
+                last_idx = idx
+
+                if done[idx]:
+                    break
+
+            # bootstrap seulement si non terminal
+            if last_idx is not None:
+                bootstrap_idx = last_idx + 1
+                if bootstrap_idx < T and not done[last_idx]:
+                    G += discount * values_target[bootstrap_idx]
+
+            targets[t] = G
+
+        values = self.forward(states).squeeze(-1)
+        loss = F.mse_loss(values, targets, reduction="mean")
         return loss
 
     def update_parameters(self, loss: torch.Tensor) -> None:
@@ -182,10 +225,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = connect_four_v3.env()  # render_mode="human")
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 50000
+EPISODE = 5000
 LR = 1e-5  # plus stable
-GAMMA = 0.99
+GAMMA = 0.9
+TD_N = 5
 ENTROPY = 1e-3
+
 
 value = Value(
     device=device,
@@ -194,7 +239,7 @@ value = Value(
 )
 policy = Policy(
     device=device,
-    lr=LR,
+    lr=LR * 10,
     n_envs=1,
 )
 
@@ -336,7 +381,7 @@ def augment_sim(memory: Memory) -> Memory:
         done=memory.done,
         reward=memory.reward,
         action=6 - memory.action,
-        mask=memory.mask.flip(0)
+        mask=memory.mask.flip(0),
     )
 
 
@@ -387,9 +432,7 @@ for i in range(EPISODE):
             )
             memory.append(frame)
 
-            memory.append(
-                augment_sim(frame)
-            )
+            # memory.append(augment_sim(frame))
             # frames = augment_d4(frame)
             # for frames_index in range(len(frames)):
             #     memory.append(frames[frames_index])
@@ -397,9 +440,11 @@ for i in range(EPISODE):
     states = [m.n_state for m in memory]
     states = torch.stack(states, dim=0)
 
-    value_loss = value.get_losses(memory=memory, gamma=GAMMA)
+    value_loss = value.get_losses(memory=memory, gamma=GAMMA, n_step=TD_N)
     value.update_parameters(value_loss)
-    policy_loss = policy.get_losses(memory=memory, critic=value, gamma=GAMMA)
+    policy_loss = policy.get_losses(
+        memory=memory, critic=value, gamma=GAMMA, n_step=TD_N
+    )
     policy.update_parameters(policy_loss)
 
     learning_value_losses.append(value_loss.detach().cpu().numpy())
@@ -484,7 +529,9 @@ while True:
             action = None
         else:
             if learning_model_round:
-                action, _, _ = select_action_by_value(env_manual, debug=True, agent=policy, train=False)
+                action, _, _ = select_action_by_value(
+                    env_manual, debug=True, agent=policy, train=False
+                )
             else:
                 ok = False
                 while not ok:
