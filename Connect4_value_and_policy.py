@@ -433,7 +433,7 @@ for episode in range(EPISODE):
         print(episode)
     memory = [[] for i in range(len(envs))]
 
-    temperature = 0.1 + 0.4 * (max(0, EPISODE - 2 * i) / EPISODE)
+    temperature = 0.1 + 0.4 * (max(0, EPISODE - 2 * episode) / EPISODE)
 
     for step in range(ROLLOUT_LEN):
         for i, env in enumerate(envs):
