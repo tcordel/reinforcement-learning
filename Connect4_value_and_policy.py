@@ -67,7 +67,7 @@ class Policy(nn.Module):
         logits_list.append(logits)
 
         # miroir horizontal
-        state_m = torch.flip(state, dims=[2])  # W
+        state_m = torch.flip(state, dims=[3])  # W
         conv_m = self.conv(state_m)
         mean_m = conv_m.mean(dim=(2, 3))
         logits_m = self.head(mean_m)
@@ -182,10 +182,10 @@ class Value(nn.Module):
         self.head_target.load_state_dict(self.head.state_dict())
 
     def symmetries(self, state):
-        # state: (C, H, W)
+        # state: (B, C, H, W)
         return [
             state,
-            torch.flip(state, dims=[2]),  # miroir horizontal
+            torch.flip(state, dims=[3]),  # miroir horizontal
         ]
 
     def forward(self, state: torch.Tensor, use_target=False) -> torch.Tensor:
@@ -309,7 +309,7 @@ softmax = nn.Softmax(dim=0)
 
 def cannonical_state(s):
     x = torch.Tensor(s).to(device)
-    x = x.permute(2, 1, 0)
+    x = x.permute(2, 0, 1) # C, H, W
     return x
 
 
