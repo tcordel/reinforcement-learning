@@ -40,7 +40,7 @@ class Policy(nn.Module):
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(),
         ]
-        fc_layers = [nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 7)]
+        fc_layers = [nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 1)]
 
         # define actor and critic networks
         self.conv = nn.Sequential(*conv_layers).to(self.device)
@@ -57,27 +57,20 @@ class Policy(nn.Module):
         return logits.flip(dims=[1])
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        # state: (B, C, H, W)
-        logits_list = []
 
         # identité
         conv = self.conv(state)
-        mean = conv.mean(dim=(2, 3))
-        logits = self.head(mean)
-        logits_list.append(logits)
+        col_feat = conv.mean(dim=(2))
+        col_feat = col_feat.permute(0, 2, 1) # (B, W, 32)
+        logits = self.head(col_feat).squeeze(-1)  # (B, W=7)
 
-        # miroir horizontal
-        state_m = torch.flip(state, dims=[3])  # W
+        state_m = torch.flip(state, dims=[3])   # flip W
         conv_m = self.conv(state_m)
-        mean_m = conv_m.mean(dim=(2, 3))
-        logits_m = self.head(mean_m)
+        col_feat_m = conv_m.mean(dim=2).permute(0,2,1)
+        logits_m = self.head(col_feat_m).squeeze(-1)
+        logits_m = logits_m.flip(dims=[1])      # reprojection action
+        return 0.5 * (logits + logits_m)
 
-        # reprojection action → repère canonique
-        logits_m = self.mirror_logits(logits_m)
-        logits_list.append(logits_m)
-
-        # pooling équivariant
-        return torch.mean(torch.stack(logits_list, dim=0), dim=0)
 
     def get_losses(self, memories: list[list[Memory]], critic: nn.Module, gamma, n_step=3):
 
@@ -293,7 +286,6 @@ policy = Policy(
     lr=LR,
     n_envs=1,
 )
-
 
 rolling_length = 20
 learning_value_losses = []
