@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from pettingzoo.utils import agent_selector
 import torch
 import torch.nn as nn
 from pettingzoo.classic import connect_four_v3
@@ -66,7 +67,7 @@ class Policy(nn.Module):
         logits_list.append(logits)
 
         # miroir horizontal
-        state_m = torch.flip(state, dims=[3])  # W
+        state_m = torch.flip(state, dims=[2])  # W
         conv_m = self.conv(state_m)
         mean_m = conv_m.mean(dim=(2, 3))
         logits_m = self.head(mean_m)
@@ -268,17 +269,17 @@ if torch.cuda.is_available():
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_ENVS = 8
-ROLLOUT_LEN = 32
+ROLLOUT_LEN = 16
 
 envs = [connect_four_v3.env() for _ in range(N_ENVS)]
 for i, env in enumerate(envs):
     env.reset(seed=42 + i)
 env_manual = connect_four_v3.env(render_mode="human")
 
-EPISODE = 2000
-LR = 1e-4  # plus stable
-GAMMA = 0.9
-TD_N = 5
+EPISODE = 10000
+LR = 1e-5  # plus stable
+GAMMA = 0.99
+TD_N = 10
 ENTROPY = 1e-3
 
 
@@ -420,18 +421,16 @@ def mirror_mask(mask):
 
 
 states = []
-players = []
 
 for env in envs:
     env.reset()
     obs, _, _, _, _ = env.last()
     states.append(cannonical_state(obs["observation"]))
-    players.append("player_0")
 
-for i in range(EPISODE):
+for episode in range(EPISODE):
 
-    if i > 0 and i % 500 == 0:
-        print(i)
+    if episode > 0 and episode % 500 == 0:
+        print(episode)
     memory = [[] for i in range(len(envs))]
 
     temperature = 0.1 + 0.4 * (max(0, EPISODE - 2 * i) / EPISODE)
@@ -441,14 +440,14 @@ for i in range(EPISODE):
             obs, reward, term, trunc, _ = env.last()
 
             if term or trunc:
-                env.reset()
-                obs, reward, _, _, _ = env.last()
-                if players[i] == "player_1":
+                agent_selection  = env.agent_selection
+                if agent_selection == "player_1":
                     reward = reward * -1
-                players[i] = "player_0"
                 first_player_losses.append(1 if reward == -1 else 0)
                 first_player_deuces.append(1 if reward == 0 else 0)
                 first_player_win.append(1 if reward == 1 else 0)
+                env.reset()
+                obs, _, _, _, _ = env.last()
 
             state = cannonical_state(obs["observation"])
             mask = torch.tensor(obs["action_mask"], device=device).bool()
@@ -484,12 +483,12 @@ for i in range(EPISODE):
     learning_value_losses.append(value_loss.detach().cpu().numpy())
     learning_policy_losses.append(policy_loss.detach().cpu().numpy())
 
-    if i > rolling_length:
-        writer.add_scalar("Wins", np.mean(first_player_win[-100:]), i)
-        writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), i)
-        writer.add_scalar("Deuces", np.mean(first_player_deuces[-100:]), i)
-        writer.add_scalar("value_loss", np.mean(learning_value_losses[-100:]), i)
-        writer.add_scalar("policy_loss", np.mean(learning_policy_losses[-100:]), i)
+    if episode > rolling_length:
+        writer.add_scalar("Wins", np.mean(first_player_win[-100:]), episode)
+        writer.add_scalar("Losses", np.mean(first_player_losses[-100:]), episode)
+        writer.add_scalar("Deuces", np.mean(first_player_deuces[-100:]), episode)
+        writer.add_scalar("value_loss", np.mean(learning_value_losses[-100:]), episode)
+        writer.add_scalar("policy_loss", np.mean(learning_policy_losses[-100:]), episode)
 
 
 fig, axs = plt.subplots(nrows=3, ncols=1, figsize=(12, 5))
