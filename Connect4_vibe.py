@@ -391,10 +391,13 @@ def train(
         print(upd)
         # Evaluate sometimes
         if upd == 1 or upd % 500 == 0:
+            torch.save(model.state_dict(), f"./vibe-{upd}.pth")
             stats = eval_vs_random(model, device, n_games=50)
             print(f"[upd={upd:04d}] steps={len(batch_steps):5d} temp={temperature:.3f} "
                   f"win/draw/loss={stats['win_rate']:.2f}/{stats['draw_rate']:.2f}/{stats['loss_rate']:.2f}")
 
+
+    torch.save(model.state_dict(), "./vibe-final.pth")
     return model
 
 
@@ -403,7 +406,6 @@ if __name__ == "__main__":
 
     model = train(total_updates=10000)
 
-    torch.save(model.state_dict(), "./vibe.pth")
 
     env_manual = connect_four_v3.env(render_mode="human")
     player = None
