@@ -30,7 +30,7 @@
 import random
 import copy
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Literal
 
 import numpy as np
 import torch
@@ -342,6 +342,66 @@ def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     neg = logits.new_full((), -1e9)
     return torch.where(mask, logits, neg)
 
+Phase = Literal["A", "B", "C"]
+
+@dataclass
+class CurriculumParams:
+    p_vs_random: float
+    micro_win_reward: float
+    ent_coef: float
+    temp_floor: float
+
+class Curriculum:
+    """
+    3 phases pilotées par métriques:
+      - A: vs random + shaping léger
+      - B: mix random/snap + shaping réduit
+      - C: quasi pur self-play, shaping 0
+    Transition:
+      A->B si win_rate_vs_random > 0.65 pendant 3 evals
+      B->C si win_rate_vs_snapshot_last > 0.55 pendant 3 evals
+    """
+    def __init__(self):
+        self.phase: Phase = "A"
+        self._stableA = 0
+        self._stableB = 0
+
+    def params(self) -> CurriculumParams:
+        if self.phase == "A":
+            return CurriculumParams(
+                p_vs_random=1.0,
+                micro_win_reward=0.05,
+                ent_coef=0.02,
+                temp_floor=1.0,
+            )
+        if self.phase == "B":
+            return CurriculumParams(
+                p_vs_random=0.5,
+                micro_win_reward=0.02,
+                ent_coef=0.015,
+                temp_floor=0.8,
+            )
+        # phase C
+        return CurriculumParams(
+            p_vs_random=0.2,
+            micro_win_reward=0.0,
+            ent_coef=0.01,
+            temp_floor=0.6,
+        )
+
+    def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
+        if self.phase == "A":
+            self._stableA = self._stableA + 1 if win_vs_random > 0.65 else 0
+            if self._stableA >= 3:
+                self.phase = "B"
+                self._stableA = 0
+        elif self.phase == "B":
+            self._stableB = self._stableB + 1 if win_vs_snapshot_last > 0.55 else 0
+            if self._stableB >= 3:
+                self.phase = "C"
+                self._stableB = 0
+        return self.phase
+
 
 # ============================================================
 # 3) PPO + GAE (single-agent view) + self-play vs snapshot pool
@@ -391,6 +451,7 @@ def collect_rollouts(
     rollout_steps: int = 4096,
     n_envs: int = 16,
     temperature: float = 1.0,
+    micro_win_reward: float = 0.0,
     p_vs_random: float = 0.2,
 ) -> Tuple[List[Transition], Dict[str, float]]:
     """
@@ -398,7 +459,7 @@ def collect_rollouts(
     Opponent is either random or a snapshot from opponent_pool.
     Each env episode: learning side is randomly assigned to X or O.
     """
-    envs = [UTTTEnv(micro_win_reward=0.0) for _ in range(n_envs)]
+    envs = [UTTTEnv(micro_win_reward=float(micro_win_reward)) for _ in range(n_envs)]
     rng = np.random.default_rng()
 
     transitions: List[Transition] = []
@@ -758,6 +819,8 @@ def train(
     device = torch.device(device_str)
     writer = SummaryWriter()
 
+    curriculum = Curriculum()
+
     model = UTTTPVNet(in_channels=7, channels=64, n_blocks=8).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
@@ -774,6 +837,10 @@ def train(
         t = (upd - 1) / max(total_updates - 1, 1)
         temperature = temperature_start + t * (temperature_end - temperature_start)
 
+        # curriculum params
+        cur = curriculum.params()
+        temperature = max(temperature, cur.temp_floor)
+
         # Collect rollouts
         model.eval()
         transitions, roll_stats = collect_rollouts(
@@ -784,6 +851,8 @@ def train(
             n_envs=n_envs,
             temperature=temperature,
             p_vs_random=p_vs_random,
+            micro_win_reward=cur.micro_win_reward,
+            p_vs_random=cur.p_vs_random,
         )
 
         # Compute GAE
@@ -828,6 +897,11 @@ def train(
         writer.add_scalar("train/ret_mean", upd_stats["ret_mean"], upd)
         writer.add_scalar("train/ret_std", upd_stats["ret_std"], upd)
         writer.add_scalar("train/temperature", temperature, upd)
+        writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[cur.phase if hasattr(cur, "phase") else curriculum.phase], upd)
+        writer.add_scalar("curriculum/p_vs_random", cur.p_vs_random, upd)
+        writer.add_scalar("curriculum/micro_win_reward", cur.micro_win_reward, upd)
+        writer.add_scalar("curriculum/ent_coef", cur.ent_coef, upd)
+        writer.add_scalar("curriculum/temp_floor", cur.temp_floor, upd)
 
         # Snapshot update
         if upd % snapshot_interval == 0:
@@ -877,6 +951,14 @@ def train(
             writer.add_scalar("eval/vs_random_win", eval_vs_random["win_rate"], upd)
             writer.add_scalar("eval/vs_random_draw", eval_vs_random["draw_rate"], upd)
             writer.add_scalar("eval/vs_random_loss", eval_vs_random["loss_rate"], upd)
+            # Curriculum phase update (piloté par métriques)
+            prev_phase = curriculum.phase
+            new_phase = curriculum.update(
+                win_vs_random=eval_vs_random["win_rate"],
+                win_vs_snapshot_last=eval_vs_snap["win_rate"],
+            )
+            if new_phase != prev_phase:
+                print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
 
             # Update a very simple Elo between "current" and "best_snapshot"
             # Score based on win/draw/loss of current vs snapshot.
