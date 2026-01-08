@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch.distributions import Categorical
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -647,6 +648,8 @@ def ppo_update(
     epochs: int = 4,
     minibatch_size: int = 512,
     value_clip: float = 0.2,
+    use_amp: bool = False,
+    scaler: Optional[GradScaler] = None,
 ) -> Dict[str, float]:
     N = obs.shape[0]
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
@@ -670,30 +673,39 @@ def ppo_update(
         for start in range(0, N, minibatch_size):
             mb = perm[start:start + minibatch_size]
 
-            logits, v = model(obs[mb])
-            logits = masked_logits(logits, masks[mb])
-            dist = Categorical(logits=logits)
+            with autocast(enabled=use_amp):
+                logits, v = model(obs[mb])
+                logits = masked_logits(logits, masks[mb])
+                dist = Categorical(logits=logits)
 
-            new_logp = dist.log_prob(actions[mb])
-            entropy = dist.entropy().mean()
+                new_logp = dist.log_prob(actions[mb])
+                entropy = dist.entropy().mean()
 
-            ratio = torch.exp(new_logp - logp_old[mb])
-            surr1 = ratio * adv[mb]
-            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv[mb]
-            pi_loss = -torch.min(surr1, surr2).mean()
+                ratio = torch.exp(new_logp - logp_old[mb])
+                surr1 = ratio * adv[mb]
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv[mb]
+                pi_loss = -torch.min(surr1, surr2).mean()
 
-            # Value clipping (PPO2 style)
-            v_clipped = v_old[mb] + torch.clamp(v - v_old[mb], -value_clip, value_clip)
-            v_loss1 = (v - returns[mb]).pow(2)
-            v_loss2 = (v_clipped - returns[mb]).pow(2)
-            v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                # Value clipping (PPO2 style)
+                v_clipped = v_old[mb] + torch.clamp(v - v_old[mb], -value_clip, value_clip)
+                v_loss1 = (v - returns[mb]).pow(2)
+                v_loss2 = (v_clipped - returns[mb]).pow(2)
+                v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
-            loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
+                loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if use_amp:
+                assert scaler is not None
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             with torch.no_grad():
                 approx_kl = (logp_old[mb] - new_logp).mean()
@@ -811,6 +823,8 @@ def train(
     max_pool: int = 20,
     p_vs_random: float = 0.2,
     eval_interval: int = 200,
+    model_channels: int = 64,
+    model_blocks: int = 8,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -818,10 +832,15 @@ def train(
 
     device = torch.device(device_str)
     writer = SummaryWriter()
+    # GPU perf options
+    use_amp = (device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     curriculum = Curriculum()
 
-    model = UTTTPVNet(in_channels=7, channels=64, n_blocks=8).to(device)
+    model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # opponent pool (snapshots)
@@ -850,7 +869,6 @@ def train(
             rollout_steps=rollout_steps,
             n_envs=n_envs,
             temperature=temperature,
-            p_vs_random=p_vs_random,
             micro_win_reward=cur.micro_win_reward,
             p_vs_random=cur.p_vs_random,
         )
@@ -881,6 +899,8 @@ def train(
             epochs=4,
             minibatch_size=512,
             value_clip=0.2,
+            use_amp=use_amp,
+            scaler=scaler,
         )
 
         # Logging
@@ -980,19 +1000,45 @@ def train(
 
 
 if __name__ == "__main__":
-    train(
-        seed=1,
-        device_str="cuda" if torch.cuda.is_available() else "cpu",
-        total_updates=2000,
-        rollout_steps=4096,
-        n_envs=16,
-        lr=2e-4,
-        gamma=0.99,
-        lam=0.95,
-        temperature_start=1.2,
-        temperature_end=0.6,
-        snapshot_interval=50,
-        max_pool=20,
-        p_vs_random=0.2,
-        eval_interval=200,
-    )
+    # Preset auto CPU/GPU:
+    if torch.cuda.is_available():
+        # GPU 1550 : update plus rapide -> batch plus gros + réseau moyen
+        train(
+            seed=1,
+            device_str="cuda",
+            total_updates=3000,
+            rollout_steps=4096,
+            n_envs=16,
+            lr=2e-4,
+            gamma=0.99,
+            lam=0.95,
+            temperature_start=1.3,
+            temperature_end=0.8,
+            snapshot_interval=50,
+            max_pool=20,
+            p_vs_random=0.2,     # (piloté par curriculum, mais laissé ici)
+            eval_interval=200,
+            model_channels=64,
+            model_blocks=6,
+        )
+    else:
+        # CPU only : réseau plus petit + rollouts plus petits => feedback rapide
+        train(
+            seed=1,
+            device_str="cpu",
+            total_updates=3000,
+            rollout_steps=2048,
+            n_envs=8,
+            lr=3e-4,
+            gamma=0.99,
+            lam=0.95,
+            temperature_start=1.3,
+            temperature_end=0.8,
+            snapshot_interval=50,
+            max_pool=20,
+            p_vs_random=0.2,
+            eval_interval=100,
+            model_channels=32,
+            model_blocks=4,
+        )
+
