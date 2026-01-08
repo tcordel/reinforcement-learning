@@ -903,6 +903,8 @@ def train(
             scaler=scaler,
         )
 
+        if upd > 0 and upd % 200 == 0:
+            torch.save(model.state_dict(), f"./uttt-{upd}.pth")
         # Logging
         writer.add_scalar("rollout/win_rate", roll_stats["win_rate"], upd)
         writer.add_scalar("rollout/draw_rate", roll_stats["draw_rate"], upd)
@@ -996,6 +998,7 @@ def train(
             )
 
     writer.close()
+    torch.save(model.state_dict(), f"./uttt-final.pth")
     return model
 
 
