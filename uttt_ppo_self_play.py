@@ -426,6 +426,19 @@ def obs_to_torch(o: Dict, device: torch.device) -> Tuple[torch.Tensor, torch.Ten
     m = torch.from_numpy(o["action_mask"]).to(device=device, dtype=torch.bool)  # (81,)
     return x, m
 
+@torch.no_grad()
+def act_greedy(model: nn.Module, x: torch.Tensor, m: torch.Tensor) -> Tuple[int, float]:
+    """
+    Greedy (deterministic) action for evaluation:
+      a = argmax(masked_logits)
+    Returns:
+      action, value
+    """
+    logits, v = model(x.unsqueeze(0))              # (1,81), (1,)
+    logits = masked_logits(logits, m.unsqueeze(0)) # (1,81)
+    a = int(torch.argmax(logits, dim=-1).item())
+    return a, float(v.item())
+
 
 @torch.no_grad()
 def act(model: nn.Module, x: torch.Tensor, m: torch.Tensor, temperature: float) -> Tuple[int, float, float]:
@@ -770,6 +783,7 @@ def play_match(
     device: torch.device,
     n_games: int = 50,
     temperature: float = 0.1,
+    deterministic: bool = False,
 ) -> Dict[str, float]:
     """
     policy_a joue contre policy_b. À chaque game, A est assigné aléatoirement à X ou O.
@@ -786,10 +800,16 @@ def play_match(
         while not env.done:
             if env.current_player == a_sign:
                 x, m = obs_to_torch(o, device)
-                a, _, _ = act(policy_a, x, m, temperature=temperature)
+                if deterministic:
+                    a, _ = act_greedy(policy_a, x, m)
+                else:
+                    a, _, _ = act(policy_a, x, m, temperature=temperature)
             else:
                 x, m = obs_to_torch(o, device)
-                a, _, _ = act(policy_b, x, m, temperature=temperature)
+                if deterministic:
+                    a, _ = act_greedy(policy_b, x, m)
+                else:
+                    a, _, _ = act(policy_b, x, m, temperature=temperature)
             o, _, _, _ = env.step(a)
 
         outcome = env.winner if env.winner is not None else 0
@@ -848,6 +868,7 @@ def train(
     eval_interval: int = 200,
     model_channels: int = 64,
     model_blocks: int = 8,
+    micro_reward_anneal_updates: int = 2000,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -885,6 +906,16 @@ def train(
         # curriculum params
         cur = curriculum.params()
         temperature = max(temperature, cur.temp_floor)
+
+        # Anneal micro_win_reward even if we stay long in phase A (prevents over-optimizing micro-game)
+        # Linear decay: 1.0 -> 0.0 over micro_reward_anneal_updates
+        if cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
+            frac = 1.0 - (upd - 1) / float(micro_reward_anneal_updates)
+            frac = float(np.clip(frac, 0.0, 1.0))
+            micro_reward_used = cur.micro_win_reward * frac
+        else:
+            micro_reward_used = cur.micro_win_reward
+
         # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
         ent_coef_used = cur.ent_coef if (prev_entropy is None or prev_entropy >= 0.8) else max(cur.ent_coef, 0.02)
  
@@ -898,7 +929,7 @@ def train(
             rollout_steps=rollout_steps,
             n_envs=n_envs,
             temperature=temperature,
-            micro_win_reward=cur.micro_win_reward,
+            micro_win_reward=micro_reward_used,
             p_vs_random=cur.p_vs_random,
             p_use_latest_snapshot=0.5,
         )
@@ -956,7 +987,9 @@ def train(
         writer.add_scalar("train/temperature", temperature, upd)
         writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[cur.phase if hasattr(cur, "phase") else curriculum.phase], upd)
         writer.add_scalar("curriculum/p_vs_random", cur.p_vs_random, upd)
-        writer.add_scalar("curriculum/micro_win_reward", cur.micro_win_reward, upd)
+        writer.add_scalar("curriculum/micro_win_reward_base", cur.micro_win_reward, upd)
+        writer.add_scalar("curriculum/micro_win_reward_used", micro_reward_used, upd)
+        writer.add_scalar("curriculum/micro_reward_anneal_updates", micro_reward_anneal_updates, upd)
         writer.add_scalar("curriculum/ent_coef", cur.ent_coef, upd)
         writer.add_scalar("curriculum/temp_floor", cur.temp_floor, upd)
 
@@ -977,7 +1010,7 @@ def train(
             # here we evaluate via play_match(current vs best_snapshot) + custom random matches separately.
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             best = opponent_pool[-1]
-            eval_vs_snap = play_match(model, best, device, n_games=80, temperature=0.1)
+            eval_vs_snap = play_match(model, best, device, n_games=80, temperature=0.1, deterministic=True)
 
             # Evaluate vs random with a small helper model that samples uniformly from legal moves
             # We'll just do explicit random opponent here:
@@ -990,7 +1023,7 @@ def train(
                 while not env.done:
                     if env.current_player == a_sign:
                         x, m = obs_to_torch(o, device)
-                        a, _, _ = act(model, x, m, temperature=0.1)
+                        a, _ = act_greedy(model, x, m)
                     else:
                         a = act_random(o["action_mask"], rng)
                     o, _, _, _ = env.step(a)
@@ -1044,7 +1077,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cuda",
-            total_updates=3000,
+            total_updates=500,
             rollout_steps=4096,
             n_envs=16,
             lr=2e-4,
@@ -1064,7 +1097,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cpu",
-            total_updates=3000,
+            total_updates=500,
             rollout_steps=2048,
             n_envs=8,
             lr=3e-4,
