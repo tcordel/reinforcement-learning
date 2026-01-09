@@ -454,6 +454,7 @@ def collect_rollouts(
     temperature: float = 1.0,
     micro_win_reward: float = 0.0,
     p_vs_random: float = 0.2,
+    p_use_latest_snapshot: float = 0.5,
 ) -> Tuple[List[Transition], Dict[str, float]]:
     """
     Collect rollouts from the perspective of the learning policy only.
@@ -491,7 +492,14 @@ def collect_rollouts(
                 if env.opponent_is_random:
                     env.opponent_model = None
                 else:
-                    env.opponent_model = random.choice(opponent_pool)
+                    # League mix: 50% latest snapshot + 50% uniform in pool
+                    if len(opponent_pool) == 1:
+                        env.opponent_model = opponent_pool[0]
+                    else:
+                        if rng.random() < p_use_latest_snapshot:
+                            env.opponent_model = opponent_pool[-1]
+                        else:
+                            env.opponent_model = random.choice(opponent_pool)
                 env._episode_fresh = False
 
             # Play until it's learning policy's turn OR terminal,
@@ -650,6 +658,7 @@ def ppo_update(
     value_clip: float = 0.2,
     use_amp: bool = False,
     scaler: Optional[GradScaler] = None,
+    target_kl: float = 0.03,
 ) -> Dict[str, float]:
     N = obs.shape[0]
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
@@ -661,6 +670,8 @@ def ppo_update(
     total_kl = 0.0
     total_clipfrac = 0.0
     n_updates = 0
+    early_stop = False
+    max_kl = 0.0
 
     # cache old values for value clipping
     with torch.no_grad():
@@ -710,13 +721,23 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = (logp_old[mb] - new_logp).mean()
                 clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+                akl = float(approx_kl.item())
+                max_kl = max(max_kl, akl)
 
             total_pi_loss += float(pi_loss.item())
             total_v_loss += float(v_loss.item())
             total_ent += float(entropy.item())
-            total_kl += float(approx_kl.item())
+            total_kl += akl
             total_clipfrac += float(clipfrac.item())
             n_updates += 1
+            
+            # Early stop PPO update if KL diverges too much
+            if akl > target_kl:
+                early_stop = True
+                break
+
+        if early_stop:
+            break
 
     # final metrics
     with torch.no_grad():
@@ -728,12 +749,14 @@ def ppo_update(
         "v_loss": total_v_loss / max(n_updates, 1),
         "entropy": total_ent / max(n_updates, 1),
         "approx_kl": total_kl / max(n_updates, 1),
+        "max_kl": max_kl,
         "clipfrac": total_clipfrac / max(n_updates, 1),
         "explained_variance": ev,
         "adv_mean": float(adv.mean().item()),
         "adv_std": float(adv.std(unbiased=False).item()),
         "ret_mean": float(returns.mean().item()),
         "ret_std": float(returns.std(unbiased=False).item()),
+        "early_stop": 1.0 if early_stop else 0.0,
     }
 
 
@@ -843,6 +866,9 @@ def train(
     model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # For entropy-adaptive control (anti-freeze)
+    prev_entropy: Optional[float] = None
+
     # opponent pool (snapshots)
     opponent_pool: List[nn.Module] = []
     snap0 = copy.deepcopy(model).to(device)
@@ -859,6 +885,9 @@ def train(
         # curriculum params
         cur = curriculum.params()
         temperature = max(temperature, cur.temp_floor)
+        # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
+        ent_coef_used = cur.ent_coef if (prev_entropy is None or prev_entropy >= 0.8) else max(cur.ent_coef, 0.02)
+ 
 
         # Collect rollouts
         model.eval()
@@ -871,6 +900,7 @@ def train(
             temperature=temperature,
             micro_win_reward=cur.micro_win_reward,
             p_vs_random=cur.p_vs_random,
+            p_use_latest_snapshot=0.5,
         )
 
         # Compute GAE
@@ -895,13 +925,15 @@ def train(
             adv=adv,
             clip_eps=0.2,
             vf_coef=0.5,
-            ent_coef=0.01,
+            ent_coef=ent_coef_used,
             epochs=4,
             minibatch_size=512,
             value_clip=0.2,
             use_amp=use_amp,
             scaler=scaler,
+            target_kl=0.03,
         )
+        prev_entropy = float(upd_stats["entropy"])
 
         if upd > 0 and upd % 200 == 0:
             torch.save(model.state_dict(), f"./uttt-{upd}.pth")
@@ -914,6 +946,9 @@ def train(
         writer.add_scalar("train/v_loss", upd_stats["v_loss"], upd)
         writer.add_scalar("train/entropy", upd_stats["entropy"], upd)
         writer.add_scalar("train/approx_kl", upd_stats["approx_kl"], upd)
+        writer.add_scalar("train/max_kl", upd_stats["max_kl"], upd)
+        writer.add_scalar("train/early_stop", upd_stats["early_stop"], upd)
+        writer.add_scalar("train/ent_coef_used", ent_coef_used, upd)
         writer.add_scalar("train/clipfrac", upd_stats["clipfrac"], upd)
         writer.add_scalar("train/explained_variance", upd_stats["explained_variance"], upd)
         writer.add_scalar("train/ret_mean", upd_stats["ret_mean"], upd)
