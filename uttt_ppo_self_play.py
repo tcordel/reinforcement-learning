@@ -30,16 +30,90 @@
 import random
 import copy
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, Literal
+from typing import Optional, Tuple, List, Dict, Literal, Union
 
+import csv
 import numpy as np
+import os
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from torch.cuda.amp import autocast, GradScaler
 from torch.distributions import Categorical
 from torch.utils.tensorboard.writer import SummaryWriter
 
+
+class CsvSummaryWriter:
+    """
+    Proxy minimal de SummaryWriter :
+    - add_scalar(...)
+    - écrit dans TensorBoard
+    - append CSV (fichier gardé ouvert)
+    """
+
+    def __init__(
+        self,
+        log_dir: Optional[str] = None,
+        *,
+    csv_path: Union[str, os.PathLike] = "metrics.csv",
+        auto_flush: bool = False,
+        **tb_kwargs,
+    ):
+        self.tb = SummaryWriter(log_dir=log_dir, **tb_kwargs)
+
+        self.csv_path = Path(csv_path)
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._csv_file = self.csv_path.open("a", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_file)
+
+        # header si fichier vide
+        if self._csv_file.tell() == 0:
+            self._csv_writer.writerow(["ts_unix", "tag", "step", "value"])
+
+        self.auto_flush = auto_flush
+
+    def add_scalar(
+        self,
+        tag: str,
+        scalar_value: float,
+        global_step: Optional[int] = None,
+        walltime: Optional[float] = None,
+    ):
+        # TensorBoard
+        self.tb.add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime)
+
+        # CSV
+        ts = time.time()
+        self._csv_writer.writerow(
+            [
+                f"{ts:.6f}",
+                tag,
+                "" if global_step is None else int(global_step),
+                repr(float(scalar_value)),
+            ]
+        )
+
+        if self.auto_flush:
+            self._csv_file.flush()
+
+    def flush(self):
+        self.tb.flush()
+        self._csv_file.flush()
+
+    def close(self):
+        self.flush()
+        self._csv_file.close()
+        self.tb.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
 # ============================================================
 # 1) ENVIRONNEMENT UTTT (actions = 81 cases, ordre row-major 9x9)
@@ -878,7 +952,7 @@ def train(
     torch.manual_seed(seed)
 
     device = torch.device(device_str)
-    writer = SummaryWriter()
+    writer = CsvSummaryWriter()
     # GPU perf options
     use_amp = (device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
