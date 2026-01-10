@@ -379,8 +379,9 @@ class Curriculum:
             return CurriculumParams(
                 p_vs_random=0.5,
                 micro_win_reward=0.02,
-                ent_coef=0.015,
-                temp_floor=0.8,
+                # Phase B: keep exploration a bit higher; your entropy collapses otherwise
+                ent_coef=0.02,
+                temp_floor=0.9,
             )
         # phase C
         return CurriculumParams(
@@ -692,7 +693,9 @@ def ppo_update(
         v_old = v_old.detach()
 
     idxs = torch.arange(N, device=obs.device)
-    for _ in range(epochs):
+    for _epoch in range(epochs):
+        epoch_kl_sum = 0.0
+        epoch_kl_n = 0
         perm = idxs[torch.randperm(N)]
         for start in range(0, N, minibatch_size):
             mb = perm[start:start + minibatch_size]
@@ -736,6 +739,8 @@ def ppo_update(
                 clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
                 akl = float(approx_kl.item())
                 max_kl = max(max_kl, akl)
+                epoch_kl_sum += akl
+                epoch_kl_n += 1
 
             total_pi_loss += float(pi_loss.item())
             total_v_loss += float(v_loss.item())
@@ -744,12 +749,10 @@ def ppo_update(
             total_clipfrac += float(clipfrac.item())
             n_updates += 1
             
-            # Early stop PPO update if KL diverges too much
-            if akl > target_kl:
-                early_stop = True
-                break
-
-        if early_stop:
+        # Epoch-level KL early stop (standard PPO behavior)
+        epoch_kl_mean = epoch_kl_sum / max(epoch_kl_n, 1)
+        if epoch_kl_mean > target_kl:
+            early_stop = True
             break
 
     # final metrics
@@ -887,6 +890,12 @@ def train(
     model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # track phase transitions to apply one-off optimizer changes
+    last_phase = curriculum.phase
+    def _set_lr(mult: float):
+        for g in optimizer.param_groups:
+            g["lr"] = float(g["lr"]) * float(mult)
+
     # For entropy-adaptive control (anti-freeze)
     prev_entropy: Optional[float] = None
 
@@ -907,6 +916,18 @@ def train(
         cur = curriculum.params()
         temperature = max(temperature, cur.temp_floor)
 
+        # Phase-dependent PPO target_kl and opponent hardness
+        if curriculum.phase == "A":
+            target_kl_used = 0.03
+            p_latest = 0.50
+        elif curriculum.phase == "B":
+            # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
+            target_kl_used = 0.04
+            p_latest = 0.70
+        else:
+            target_kl_used = 0.04
+            p_latest = 0.80
+
         # Anneal micro_win_reward even if we stay long in phase A (prevents over-optimizing micro-game)
         # Linear decay: 1.0 -> 0.0 over micro_reward_anneal_updates
         if cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
@@ -917,7 +938,15 @@ def train(
             micro_reward_used = cur.micro_win_reward
 
         # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
-        ent_coef_used = cur.ent_coef if (prev_entropy is None or prev_entropy >= 0.8) else max(cur.ent_coef, 0.02)
+        # Slightly stronger rescue when entropy is really low (your run drops <0.3)
+        if prev_entropy is None:
+            ent_coef_used = cur.ent_coef
+        elif prev_entropy < 0.5:
+            ent_coef_used = max(cur.ent_coef, 0.03)
+        elif prev_entropy < 0.8:
+            ent_coef_used = max(cur.ent_coef, 0.02)
+        else:
+            ent_coef_used = cur.ent_coef
  
 
         # Collect rollouts
@@ -931,7 +960,7 @@ def train(
             temperature=temperature,
             micro_win_reward=micro_reward_used,
             p_vs_random=cur.p_vs_random,
-            p_use_latest_snapshot=0.5,
+            p_use_latest_snapshot=p_latest,
         )
 
         # Compute GAE
@@ -962,7 +991,7 @@ def train(
             value_clip=0.2,
             use_amp=use_amp,
             scaler=scaler,
-            target_kl=0.03,
+            target_kl=target_kl_used,
         )
         prev_entropy = float(upd_stats["entropy"])
 
@@ -1049,6 +1078,14 @@ def train(
             )
             if new_phase != prev_phase:
                 print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
+                # One-off optimizer changes at phase transitions:
+                # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
+                # Reducing LR makes policy updates smoother and improves snapshot progress.
+                if new_phase == "B":
+                    _set_lr(0.5)   # halve LR once
+                elif new_phase == "C":
+                    _set_lr(0.8)   # slight reduction
+                last_phase = new_phase
 
             # Update a very simple Elo between "current" and "best_snapshot"
             # Score based on win/draw/loss of current vs snapshot.
@@ -1077,7 +1114,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cuda",
-            total_updates=500,
+            total_updates=5000,
             rollout_steps=4096,
             n_envs=16,
             lr=2e-4,
@@ -1097,7 +1134,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cpu",
-            total_updates=500,
+            total_updates=5000,
             rollout_steps=2048,
             n_envs=8,
             lr=3e-4,
