@@ -239,8 +239,8 @@ class UTTTEnv:
     def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
         """
         Executes action for current_player, toggles current_player, returns obs for next player.
-        Reward returned here is *shaping only* + (terminal outcome for the player who acted) if terminal on this move.
-        For PPO, we will still use final outcome properly from env.winner at episode end.
+        Reward returned here is *shaping only*.
+        Terminal outcome is read from env.winner (and should be added exactly once by the rollout code).
         """
         if self.done:
             return self._get_obs(), 0.0, True, {}
@@ -250,8 +250,8 @@ class UTTTEnv:
             # illegal move => immediate loss for current_player
             self.done = True
             self.winner = -self.current_player
-            # reward for player who acted (illegal) is -1
-            r = -1.0
+            # shaping is 0; terminal outcome must be handled via env.winner
+            r = 0.0
             # toggle player for consistency
             self.current_player *= -1
             return self._get_obs(), r, True, {"illegal": True}
@@ -281,19 +281,9 @@ class UTTTEnv:
         else:
             self.next_board = -1
 
-        # Terminal reward for the mover (optional; PPO code below uses env.winner anyway)
-        terminal_r = 0.0
-        if self.done:
-            if self.winner == self.current_player:
-                terminal_r = 1.0
-            elif self.winner == 0:
-                terminal_r = 0.0
-            else:
-                terminal_r = -1.0  # should not happen here except illegal handled above
-
         # toggle player
         self.current_player *= -1
-        return self._get_obs(), float(shaping + terminal_r), self.done, {}
+        return self._get_obs(), float(shaping), self.done, {}
 
     def _get_obs(self) -> Dict:
         """
@@ -523,7 +513,7 @@ def act(model: nn.Module, x: torch.Tensor, m: torch.Tensor, temperature: float) 
     logits = masked_logits(logits, m.unsqueeze(0))
     dist = Categorical(logits=logits)
     a = int(dist.sample().item())
-    logp = float(dist.log_prob(torch.tensor(a, device=x.device)).item())
+    logp = float(dist.log_prob(torch.tensor([a], device=x.device)).item())
     return a, logp, float(v.item())
 
 
