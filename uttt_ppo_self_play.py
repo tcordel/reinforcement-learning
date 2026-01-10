@@ -890,11 +890,21 @@ def train(
     model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+     # --- Adaptive control to avoid "always early-stop" late in phase B
+    early_stop_ema = 0.0
+    early_stop_ema_beta = 0.98  # slow EMA
+    min_lr = max(lr * 0.05, 1e-5)  # don't go too low on CPU
+
     # track phase transitions to apply one-off optimizer changes
     last_phase = curriculum.phase
     def _set_lr(mult: float):
         for g in optimizer.param_groups:
             g["lr"] = float(g["lr"]) * float(mult)
+            if g["lr"] < min_lr:
+                g["lr"] = min_lr
+
+    def _get_lr() -> float:
+        return float(optimizer.param_groups[0]["lr"])
 
     # For entropy-adaptive control (anti-freeze)
     prev_entropy: Optional[float] = None
@@ -920,13 +930,19 @@ def train(
         if curriculum.phase == "A":
             target_kl_used = 0.03
             p_latest = 0.50
+            ppo_epochs_used = 4
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
             target_kl_used = 0.04
             p_latest = 0.70
+            # Key change: reduce PPO epochs when we start hitting KL early-stop often.
+            # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
+            # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
+            ppo_epochs_used = 3 if early_stop_ema < 0.35 else 2
         else:
             target_kl_used = 0.04
             p_latest = 0.80
+            ppo_epochs_used = 2
 
         # Anneal micro_win_reward even if we stay long in phase A (prevents over-optimizing micro-game)
         # Linear decay: 1.0 -> 0.0 over micro_reward_anneal_updates
@@ -986,7 +1002,7 @@ def train(
             clip_eps=0.2,
             vf_coef=0.5,
             ent_coef=ent_coef_used,
-            epochs=4,
+            epochs=ppo_epochs_used,
             minibatch_size=512,
             value_clip=0.2,
             use_amp=use_amp,
@@ -994,6 +1010,12 @@ def train(
             target_kl=target_kl_used,
         )
         prev_entropy = float(upd_stats["entropy"])
+
+        # Update EMA early-stop and adapt LR if we are constantly on the KL limiter
+        early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
+        # If we keep early-stopping, decay LR gently to get out of the "butée"
+        if curriculum.phase != "A" and early_stop_ema > 0.60:
+            _set_lr(0.98)
 
         if upd > 0 and upd % 200 == 0:
             torch.save(model.state_dict(), f"./uttt-{upd}.pth")
@@ -1008,6 +1030,10 @@ def train(
         writer.add_scalar("train/approx_kl", upd_stats["approx_kl"], upd)
         writer.add_scalar("train/max_kl", upd_stats["max_kl"], upd)
         writer.add_scalar("train/early_stop", upd_stats["early_stop"], upd)
+        writer.add_scalar("train/early_stop_ema", early_stop_ema, upd)
+        writer.add_scalar("train/lr", _get_lr(), upd)
+        writer.add_scalar("train/target_kl_used", target_kl_used, upd)
+        writer.add_scalar("train/ppo_epochs_used", ppo_epochs_used, upd)
         writer.add_scalar("train/ent_coef_used", ent_coef_used, upd)
         writer.add_scalar("train/clipfrac", upd_stats["clipfrac"], upd)
         writer.add_scalar("train/explained_variance", upd_stats["explained_variance"], upd)
