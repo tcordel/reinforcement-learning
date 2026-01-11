@@ -115,6 +115,8 @@ class CsvSummaryWriter:
         self.close()
         return False
 
+
+writer = CsvSummaryWriter()
 # ============================================================
 # 1) ENVIRONNEMENT UTTT (actions = 81 cases, ordre row-major 9x9)
 # ============================================================
@@ -435,9 +437,9 @@ class Curriculum:
         if self.phase == "A":
             return CurriculumParams(
                 p_vs_random=1.0,
-                micro_win_reward=0.05,
+                micro_win_reward=0.1,
                 ent_coef=0.02,
-                temp_floor=1.0,
+                temp_floor=0.9,
             )
         if self.phase == "B":
             return CurriculumParams(
@@ -747,6 +749,8 @@ def ppo_update(
     use_amp: bool = False,
     scaler: Optional[GradScaler] = None,
     target_kl: float = 0.03,
+    temperature: float = 1.0,
+    upd: int = 0,
 ) -> Dict[str, float]:
     N = obs.shape[0]
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
@@ -776,6 +780,7 @@ def ppo_update(
 
             with autocast(enabled=use_amp):
                 logits, v = model(obs[mb])
+                logits = logits / max(temperature, 1e-6)
                 logits = masked_logits(logits, masks[mb])
                 dist = Categorical(logits=logits)
 
@@ -832,6 +837,7 @@ def ppo_update(
     # final metrics
     with torch.no_grad():
         _, v_pred = model(obs)
+        writer.add_scalar("debug/value_mse", F.mse_loss(v_pred, returns).item(), upd)
     ev = explained_variance(v_pred, returns)
 
     return {
@@ -953,7 +959,6 @@ def train(
     torch.manual_seed(seed)
 
     device = torch.device(device_str)
-    writer = CsvSummaryWriter()
     # GPU perf options
     use_amp = (device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
@@ -1090,6 +1095,8 @@ def train(
             use_amp=use_amp,
             scaler=scaler,
             target_kl=target_kl_used,
+            temperature=temperature,
+            upd=upd
         )
         prev_entropy = float(upd_stats["entropy"])
 
@@ -1129,6 +1136,8 @@ def train(
         writer.add_scalar("curriculum/micro_reward_anneal_updates", micro_reward_anneal_updates, upd)
         writer.add_scalar("curriculum/ent_coef", cur.ent_coef, upd)
         writer.add_scalar("curriculum/temp_floor", cur.temp_floor, upd)
+        writer.add_scalar("debug/adv_abs_mean", torch.mean(torch.abs(adv)).item(), upd)
+        writer.add_scalar("debug/adv_pos_frac", (adv > 0).float().mean().item(), upd)
 
         # Periodic evaluation
         if upd % eval_interval == 0:
