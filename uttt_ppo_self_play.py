@@ -977,6 +977,7 @@ def train(
 
     # track phase transitions to apply one-off optimizer changes
     last_phase = curriculum.phase
+
     def _set_lr(mult: float):
         for g in optimizer.param_groups:
             g["lr"] = float(g["lr"]) * float(mult)
@@ -1155,9 +1156,11 @@ def train(
             rng = np.random.default_rng()
             env = UTTTEnv(micro_win_reward=0.0)
             wins = draws = losses = 0
-            for _ in range(80):
+            n_eval = 80
+            for gi in range(n_eval):
                 o = env.reset(seed=int(rng.integers(0, 10_000_000)))
-                a_sign = 1 if rng.integers(0, 2) == 0 else -1
+                # Force 50% X / 50% O to reduce variance in curriculum signal
+                a_sign = 1 if gi < (n_eval // 2) else -1
                 while not env.done:
                     if env.current_player == a_sign:
                         x, m = obs_to_torch(o, device)
@@ -1170,7 +1173,7 @@ def train(
                 if score > 0: wins += 1
                 elif score < 0: losses += 1
                 else: draws += 1
-            eval_vs_random = {"win_rate": wins/80, "draw_rate": draws/80, "loss_rate": losses/80}
+            eval_vs_random = {"win_rate": wins/n_eval, "draw_rate": draws/n_eval, "loss_rate": losses/n_eval}
 
             writer.add_scalar("eval/vs_snapshot_win", eval_vs_snap["win_rate"], upd)
             writer.add_scalar("eval/vs_snapshot_draw", eval_vs_snap["draw_rate"], upd)
@@ -1195,6 +1198,9 @@ def train(
                 elif new_phase == "C":
                     _set_lr(0.8)   # slight reduction
                 last_phase = new_phase
+                # Reset phase clock so anneals start *at phase entry*
+                phase_start_upd = upd
+
 
             # Update a very simple Elo between "current" and "best_snapshot"
             # Score based on win/draw/loss of current vs snapshot.
