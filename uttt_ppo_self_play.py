@@ -48,7 +48,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 class CsvSummaryWriter:
     """
     Proxy minimal de SummaryWriter :
-    - add_scalar(...)
+    - add_scalar()
     - écrit dans TensorBoard
     - append CSV (fichier gardé ouvert)
     """
