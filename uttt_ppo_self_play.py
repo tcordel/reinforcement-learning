@@ -398,7 +398,7 @@ class UTTTPVNet(nn.Module):
 
         v = self.v_head(x).flatten(1)     # (B,8*9*9)
         v = F.relu(self.v_fc1(v))
-        v = torch.tanh(self.v_fc2(v)).squeeze(-1)
+        v = self.v_fc2(v).squeeze(-1)
         return logits, v
 
 
@@ -457,7 +457,7 @@ class Curriculum:
 
     def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
         if self.phase == "A":
-            self._stableA = self._stableA + 1 if win_vs_random > 0.65 else 0
+            self._stableA = self._stableA + 1 if win_vs_random >= 0.65 else 0
             if self._stableA >= 3:
                 self.phase = "B"
                 self._stableA = 0
@@ -475,6 +475,7 @@ class Curriculum:
 
 @dataclass
 class Transition:
+    env_id: int             # which vector-env produced this transition
     obs: torch.Tensor        # (C,9,9) CPU
     mask: torch.Tensor       # (81,) bool CPU
     action: int
@@ -650,6 +651,7 @@ def collect_rollouts(
 
             transitions.append(
                 Transition(
+                    env_id=i,
                     obs=torch.from_numpy(o["obs"]).to(dtype=torch.float32).cpu(),
                     mask=torch.from_numpy(o["action_mask"]).to(dtype=torch.bool).cpu(),
                     action=a,
@@ -700,12 +702,20 @@ def compute_gae(
 
     # GAE in reverse
     adv = torch.zeros((N,), device=device)
-    gae = 0.0
-    for t in reversed(range(N)):
-        nonterminal = 1.0 - dones[t]
-        delta = rewards[t] + gamma * nonterminal * next_values[t] - values[t]
-        gae = delta + gamma * lam * nonterminal * gae
-        adv[t] = gae
+
+    # IMPORTANT: transitions are interleaved across n_envs.
+    # We must compute GAE per env_id to avoid leaking advantages between unrelated episodes/envs.
+    env_ids = torch.tensor([t.env_id for t in transitions], device=device, dtype=torch.long)
+    unique_envs = torch.unique(env_ids)
+    for eid in unique_envs.tolist():
+        idxs = (env_ids == eid).nonzero(as_tuple=False).squeeze(-1)
+        # idxs are in chronological order for that env; process reversed for GAE
+        gae = torch.tensor(0.0, device=device)
+        for j in reversed(idxs.tolist()):
+            nonterminal = 1.0 - dones[j]
+            delta = rewards[j] + gamma * nonterminal * next_values[j] - values[j]
+            gae = delta + gamma * lam * nonterminal * gae
+            adv[j] = gae
 
     returns = adv + values
     return obs, masks, actions, logp_old, returns.detach(), adv.detach()
@@ -860,9 +870,10 @@ def play_match(
     env = UTTTEnv(micro_win_reward=0.0)
     wins = draws = losses = 0
 
-    for _ in range(n_games):
+    for gi in range(n_games):
         o = env.reset(seed=int(rng.integers(0, 10_000_000)))
-        a_sign = 1 if rng.integers(0, 2) == 0 else -1  # policy_a is X or O
+        # Force 50% games with A as X (starts), 50% with A as O
+        a_sign = 1 if gi < (n_games // 2) else -1
 
         while not env.done:
             if env.current_player == a_sign:
@@ -981,6 +992,8 @@ def train(
 
     elo = Elo(k=16.0)
 
+    phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
+
     for upd in range(1, total_updates + 1):
         # temperature schedule
         t = (upd - 1) / max(total_updates - 1, 1)
@@ -1008,10 +1021,15 @@ def train(
             p_latest = 0.80
             ppo_epochs_used = 2
 
-        # Anneal micro_win_reward even if we stay long in phase A (prevents over-optimizing micro-game)
-        # Linear decay: 1.0 -> 0.0 over micro_reward_anneal_updates
-        if cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
-            frac = 1.0 - (upd - 1) / float(micro_reward_anneal_updates)
+        # Shaping schedule:
+        # - Phase A: keep shaping constant to reliably beat random
+        # - Phase B: anneal shaping from phase entry over micro_reward_anneal_updates
+        # - Phase C: shaping already 0
+        if curriculum.phase == "A":
+            micro_reward_used = cur.micro_win_reward
+        elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
+            phase_age = max(0, upd - phase_start_upd)
+            frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
             frac = float(np.clip(frac, 0.0, 1.0))
             micro_reward_used = cur.micro_win_reward * frac
         else:
@@ -1112,14 +1130,6 @@ def train(
         writer.add_scalar("curriculum/ent_coef", cur.ent_coef, upd)
         writer.add_scalar("curriculum/temp_floor", cur.temp_floor, upd)
 
-        # Snapshot update
-        if upd % snapshot_interval == 0:
-            snap = copy.deepcopy(model).to(device)
-            snap.eval()
-            opponent_pool.append(snap)
-            if len(opponent_pool) > max_pool:
-                opponent_pool.pop(0)
-
         # Periodic evaluation
         if upd % eval_interval == 0:
             model.eval()
@@ -1191,6 +1201,14 @@ def train(
                 f"evalS win={eval_vs_snap['win_rate']:.2f} "
                 f"KL={upd_stats['approx_kl']:.4f} ent={upd_stats['entropy']:.3f} EV={upd_stats['explained_variance']:.2f}"
             )
+
+        # Snapshot update (AFTER eval so evalS compares to an older snapshot)
+        if upd % snapshot_interval == 0:
+            snap = copy.deepcopy(model).to(device)
+            snap.eval()
+            opponent_pool.append(snap)
+            if len(opponent_pool) > max_pool:
+                opponent_pool.pop(0)
 
     writer.close()
     torch.save(model.state_dict(), f"./uttt-final.pth")
