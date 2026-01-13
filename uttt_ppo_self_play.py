@@ -44,7 +44,167 @@ import time
 from torch.cuda.amp import autocast, GradScaler
 from torch.distributions import Categorical
 from torch.utils.tensorboard.writer import SummaryWriter
+import threading
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
+# ==========================
+# Live Hyperparameter Server
+# ==========================
+
+LIVE_HP_LOCK = threading.Lock()
+LIVE_HP = {
+    # None = "no override"
+    "p_vs_random": None,             # float [0..1]
+    "p_use_latest_snapshot": None,   # float [0..1]
+    "elo_tau": None,                 # float > 0
+    "strong_bias": None,             # float >= 0
+    "strong_scale": None,            # float > 0
+
+    "target_kl": None,               # float > 0
+    "ent_coef": None,                # float >= 0
+    "temperature": None,             # float > 0 (override schedule)
+}
+
+LIVE_HP_HTML = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>UTTT Live Hyperparams</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; max-width: 720px; }
+    .row { display: flex; gap: 12px; margin: 8px 0; align-items: center; }
+    label { width: 220px; }
+    input { flex: 1; padding: 8px; }
+    button { padding: 10px 14px; margin-right: 10px; }
+    .muted { color: #666; font-size: 0.9em; }
+    pre { background: #f4f4f4; padding: 12px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h2>UTTT Live Hyperparams</h2>
+  <p class="muted">
+    Laisse vide pour "pas d'override". Valeurs appliquées au prochain update.
+  </p>
+
+  <div id="form"></div>
+
+  <div class="row">
+    <button onclick="apply()">Apply</button>
+    <button onclick="refresh()">Refresh</button>
+  </div>
+
+  <h3>Current live config</h3>
+  <pre id="out"></pre>
+
+<script>
+const fields = [
+  ["p_vs_random", "float 0..1"],
+  ["p_use_latest_snapshot", "float 0..1"],
+  ["elo_tau", "float > 0"],
+  ["strong_bias", "float >= 0"],
+  ["strong_scale", "float > 0"],
+  ["target_kl", "float > 0"],
+  ["ent_coef", "float >= 0"],
+  ["temperature", "float > 0 (override schedule)"],
+];
+
+function mkForm(cfg) {
+  const root = document.getElementById("form");
+  root.innerHTML = "";
+  fields.forEach(([k, hint]) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const lab = document.createElement("label");
+    lab.textContent = k + " (" + hint + ")";
+    const inp = document.createElement("input");
+    inp.id = "inp_" + k;
+    inp.placeholder = "empty = no override";
+    inp.value = (cfg[k] === null || cfg[k] === undefined) ? "" : String(cfg[k]);
+    row.appendChild(lab);
+    row.appendChild(inp);
+    root.appendChild(row);
+  });
+}
+
+async function refresh() {
+  const r = await fetch("/api/hp");
+  const cfg = await r.json();
+  mkForm(cfg);
+  document.getElementById("out").textContent = JSON.stringify(cfg, null, 2);
+}
+
+async function apply() {
+  const payload = {};
+  fields.forEach(([k,_]) => {
+    const v = document.getElementById("inp_" + k).value.trim();
+    payload[k] = (v === "") ? null : Number(v);
+  });
+  const r = await fetch("/api/hp", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload) });
+  const cfg = await r.json();
+  document.getElementById("out").textContent = JSON.stringify(cfg, null, 2);
+}
+
+refresh();
+</script>
+</body>
+</html>
+"""
+
+class LiveHPHandler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, ctype: str = "text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        p = urlparse(self.path).path
+        if p == "/" or p == "/index.html":
+            self._send(200, LIVE_HP_HTML.encode("utf-8"))
+            return
+        if p == "/api/hp":
+            with LIVE_HP_LOCK:
+                body = json.dumps(LIVE_HP).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        p = urlparse(self.path).path
+        if p != "/api/hp":
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+
+        n = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(n)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            self._send(400, f"bad json: {e}".encode("utf-8"), "text/plain; charset=utf-8")
+            return
+
+        # Merge allowed keys only
+        with LIVE_HP_LOCK:
+            for k in LIVE_HP.keys():
+                if k in data:
+                    LIVE_HP[k] = data[k]
+            body = json.dumps(LIVE_HP).encode("utf-8")
+
+        self._send(200, body, "application/json; charset=utf-8")
+
+def start_live_hp_server(host: str = "127.0.0.1", port: int = 8080):
+    srv = ThreadingHTTPServer((host, port), LiveHPHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv
+
+
+############################
+# WRAPPER over tansorboard #
+############################
 
 class CsvSummaryWriter:
     """
@@ -1083,6 +1243,7 @@ def train(
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
     for upd in range(1, total_updates + 1):
+
         # temperature schedule
         t = (upd - 1) / max(total_updates - 1, 1)
         temperature = temperature_start + t * (temperature_end - temperature_start)
@@ -1134,6 +1295,26 @@ def train(
         else:
             ent_coef_used = cur.ent_coef
  
+
+        # ---- Apply live overrides (if any) ----
+        with LIVE_HP_LOCK:
+            hp = dict(LIVE_HP)
+
+        def _ov(name, default):
+            v = hp.get(name, None)
+            return default if (v is None) else float(v)
+        
+        # overrides (only if user set them)
+        p_vs_random_used = _ov("p_vs_random", cur.p_vs_random)
+        p_latest_used = _ov("p_use_latest_snapshot", p_latest)
+        elo_tau_used = _ov("elo_tau", 200.0)
+        strong_bias_used = _ov("strong_bias", 0.30)
+        strong_scale_used = _ov("strong_scale", 200.0)
+        
+        target_kl_used = _ov("target_kl", target_kl_used)
+        ent_coef_used = _ov("ent_coef", ent_coef_used)
+        temperature = _ov("temperature", temperature)
+        
 
         # Collect rollouts
         model.eval()
@@ -1218,13 +1399,18 @@ def train(
         writer.add_scalar("train/ret_mean", upd_stats["ret_mean"], upd)
         writer.add_scalar("train/ret_std", upd_stats["ret_std"], upd)
         writer.add_scalar("train/temperature", temperature, upd)
+        writer.add_scalar("train/target_kl", target_kl_used, upd)
         writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[cur.phase if hasattr(cur, "phase") else curriculum.phase], upd)
-        writer.add_scalar("curriculum/p_vs_random", cur.p_vs_random, upd)
+        writer.add_scalar("curriculum/p_vs_random", p_vs_random_used, upd)
+        writer.add_scalar("curriculum/p_latest", p_latest_used, upd)
         writer.add_scalar("curriculum/micro_win_reward_base", cur.micro_win_reward, upd)
         writer.add_scalar("curriculum/micro_win_reward_used", micro_reward_used, upd)
         writer.add_scalar("curriculum/micro_reward_anneal_updates", micro_reward_anneal_updates, upd)
-        writer.add_scalar("curriculum/ent_coef", cur.ent_coef, upd)
+        writer.add_scalar("curriculum/ent_coef", ent_coef_used, upd)
         writer.add_scalar("curriculum/temp_floor", cur.temp_floor, upd)
+        writer.add_scalar("curriculum/elo_tau", elo_tau_used, upd)
+        writer.add_scalar("curriculum/strong_bias", strong_bias_used, upd)
+        writer.add_scalar("curriculum/strong_scale", strong_scale_used, upd)
         writer.add_scalar("debug/adv_abs_mean", torch.mean(torch.abs(adv)).item(), upd)
         writer.add_scalar("debug/adv_pos_frac", (adv > 0).float().mean().item(), upd)
 
@@ -1344,6 +1530,9 @@ def train(
 
 
 if __name__ == "__main__":
+    port = 8081
+    server = start_live_hp_server(host="127.0.0.1", port=port)
+    print(f"Live HP server on http://127.0.0.1:{port}")
     # Preset auto CPU/GPU:
     if torch.cuda.is_available():
         # GPU 1550 : update plus rapide -> batch plus gros + réseau moyen
