@@ -451,7 +451,7 @@ class Curriculum:
             )
         # phase C
         return CurriculumParams(
-            p_vs_random=0.2,
+            p_vs_random=0.35,   # anti-forgetting vs random
             micro_win_reward=0.0,
             ent_coef=0.01,
             temp_floor=0.6,
@@ -997,6 +997,9 @@ def train(
     opponent_pool.append(snap0)
 
     elo = Elo(k=16.0)
+    # "champion" best-so-far (frozen)
+    best_model = copy.deepcopy(model).to(device)
+    best_model.eval()
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
@@ -1107,7 +1110,7 @@ def train(
         if curriculum.phase != "A" and early_stop_ema > 0.60:
             _set_lr(0.98)
 
-        if upd > 0 and upd % 200 == 0:
+        if upd > 0 and upd % eval_interval == 0:
             torch.save(model.state_dict(), f"./uttt-{upd}.pth")
         # Logging
         writer.add_scalar("rollout/win_rate", roll_stats["win_rate"], upd)
@@ -1148,8 +1151,13 @@ def train(
             # We'll approximate random by using a snapshot that samples uniformly:
             # here we evaluate via play_match(current vs best_snapshot) + custom random matches separately.
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
-            best = opponent_pool[-1]
-            eval_vs_snap = play_match(model, best, device, n_games=80, temperature=0.1, deterministic=True)
+            last_snap = opponent_pool[-1]
+            eval_vs_snap = play_match(model, last_snap, device, n_games=80, temperature=0.1, deterministic=True)
+
+            eval_vs_best = play_match(model, best_model, device, n_games=80, temperature=0.1, deterministic=True)
+            writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
+            writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
+            writer.add_scalar("eval/vs_champion_loss", eval_vs_best["loss_rate"], upd)
 
             # Evaluate vs random with a small helper model that samples uniformly from legal moves
             # We'll just do explicit random opponent here:
@@ -1213,9 +1221,19 @@ def train(
                 f"[upd={upd:05d}] "
                 f"roll win/draw/loss={roll_stats['win_rate']:.2f}/{roll_stats['draw_rate']:.2f}/{roll_stats['loss_rate']:.2f} "
                 f"evalR win={eval_vs_random['win_rate']:.2f} "
-                f"evalS win={eval_vs_snap['win_rate']:.2f} "
+                f"evalS(last) win={eval_vs_snap['win_rate']:.2f} "
+                f"evalC win={eval_vs_best['win_rate']:.2f} "
                 f"KL={upd_stats['approx_kl']:.4f} ent={upd_stats['entropy']:.3f} EV={upd_stats['explained_variance']:.2f}"
             )
+
+            # Promote to champion if current consistently beats champion
+            # (threshold can be tuned; keep it conservative to avoid oscillations)
+            if eval_vs_best["win_rate"] - eval_vs_best["loss_rate"] >= 0.10:
+                best_model = copy.deepcopy(model).to(device)
+                best_model.eval()
+                writer.add_scalar("eval/champion_promoted", 1.0, upd)
+            else:
+                writer.add_scalar("eval/champion_promoted", 0.0, upd)
 
         # Snapshot update (AFTER eval so evalS compares to an older snapshot)
         if upd % snapshot_interval == 0:
@@ -1257,7 +1275,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cpu",
-            total_updates=5000,
+            total_updates=10000,
             rollout_steps=2048,
             n_envs=8,
             lr=3e-4,
