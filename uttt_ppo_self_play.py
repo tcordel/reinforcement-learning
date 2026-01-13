@@ -570,6 +570,121 @@ def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     neg = logits.new_full((), -1e9)
     return torch.where(mask, logits, neg)
 
+# ============================================================
+# Symmetry augmentation (D4) for UTTT: 8 transformations on 9x9
+# Applied ONLY at training time (after GAE) to keep rollouts/GAE coherent.
+# ============================================================
+
+def _a_to_rc(a: int) -> Tuple[int, int]:
+    return a // 9, a % 9
+
+def _rc_to_a(r: int, c: int) -> int:
+    return r * 9 + c
+
+def _transform_rc(r: int, c: int, k: int) -> Tuple[int, int]:
+    # k in [0..7] : D4 on 9x9
+    if k == 0:   return r, c
+    if k == 1:   return c, 8 - r           # rot90
+    if k == 2:   return 8 - r, 8 - c       # rot180
+    if k == 3:   return 8 - c, r           # rot270
+    if k == 4:   return r, 8 - c           # flip left-right
+    if k == 5:   return 8 - r, c           # flip up-down
+    if k == 6:   return c, r               # main diagonal
+    if k == 7:   return 8 - c, 8 - r       # anti-diagonal
+    raise ValueError(f"bad symmetry k={k}")
+
+def _transform_action(a: int, k: int) -> int:
+    r, c = _a_to_rc(a)
+    r2, c2 = _transform_rc(r, c, k)
+    return _rc_to_a(r2, c2)
+
+# Precompute action permutation for each symmetry:
+# perm[k, a_old] = a_new
+_ACTION_PERM_NP = np.zeros((8, 81), dtype=np.int64)
+for _k in range(8):
+    for _a in range(81):
+        _ACTION_PERM_NP[_k, _a] = _transform_action(_a, _k)
+
+def _perm_on_device(device: torch.device) -> torch.Tensor:
+    # (8,81) int64 on device
+    return torch.from_numpy(_ACTION_PERM_NP).to(device=device, dtype=torch.long)
+
+def _transform_board_batch(x: torch.Tensor, k: int) -> torch.Tensor:
+    # x: (..., 9, 9) -> same shape, transformed on last two dims
+    if k == 0:
+        return x
+    if k == 1:
+        return torch.rot90(x, 1, (-2, -1))
+    if k == 2:
+        return torch.rot90(x, 2, (-2, -1))
+    if k == 3:
+        return torch.rot90(x, 3, (-2, -1))
+    if k == 4:
+        return torch.flip(x, (-1,))
+    if k == 5:
+        return torch.flip(x, (-2,))
+    if k == 6:
+        return x.transpose(-2, -1)
+    if k == 7:
+        return torch.flip(x.transpose(-2, -1), (-1,))
+    raise ValueError(f"bad symmetry k={k}")
+
+def _augment_symmetries(
+    obs: torch.Tensor,
+    masks: torch.Tensor,
+    actions: torch.Tensor,
+    logp_old: torch.Tensor,
+    returns: torch.Tensor,
+    adv: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Expand batch by x8 using D4 symmetries.
+    Inputs:
+      obs: (N,C,9,9), masks: (N,81) bool, actions: (N,), logp_old/returns/adv: (N,)
+    Outputs:
+      same fields with first dimension = 8N
+    """
+    device = obs.device
+    perm = _perm_on_device(device)  # (8,81)
+    N = obs.shape[0]
+
+    obs_out = []
+    masks_out = []
+    actions_out = []
+    logp_out = []
+    returns_out = []
+    adv_out = []
+
+    for k in range(8):
+        # obs: apply transform on last dims for all channels
+        o_k = _transform_board_batch(obs, k)  # (N,C,9,9)
+
+        # masks: m2[:, perm[k, a_old]] = masks[:, a_old]
+        m2 = torch.zeros_like(masks)
+        idx = perm[k].view(1, 81).expand(N, 81)
+        m2.scatter_(1, idx, masks.to(torch.uint8))
+        m_k = m2.bool()
+
+        # actions: a_new = perm[k, a_old]
+        a_k = perm[k][actions]
+
+        obs_out.append(o_k)
+        masks_out.append(m_k)
+        actions_out.append(a_k)
+        logp_out.append(logp_old)
+        returns_out.append(returns)
+        adv_out.append(adv)
+
+    return (
+        torch.cat(obs_out, dim=0),
+        torch.cat(masks_out, dim=0),
+        torch.cat(actions_out, dim=0),
+        torch.cat(logp_out, dim=0),
+        torch.cat(returns_out, dim=0),
+        torch.cat(adv_out, dim=0),
+    )
+
+
 Phase = Literal["A", "B", "C"]
 
 @dataclass
@@ -1337,6 +1452,12 @@ def train(
             device=device,
             gamma=gamma,
             lam=lam,
+        )
+
+        # --- D4 symmetry augmentation (x8) ---
+        # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
+        obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+            obs, masks, actions, logp_old, returns, adv
         )
 
         # PPO update
