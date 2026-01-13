@@ -1555,7 +1555,7 @@ if __name__ == "__main__":
         train(
             seed=1,
             device_str="cpu",
-            total_updates=10000,
+            total_updates=100000,
             rollout_steps=2048,
             n_envs=8,
             lr=3e-4,
