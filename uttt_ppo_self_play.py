@@ -34,6 +34,7 @@ from typing import Optional, Tuple, List, Dict, Literal, Union
 
 import csv
 import numpy as np
+import math
 import os
 from pathlib import Path
 import torch
@@ -530,10 +531,51 @@ def act_random(mask: np.ndarray, rng: np.random.Generator) -> int:
     legal = np.flatnonzero(mask)
     return int(rng.choice(legal))
 
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+def sample_opponent_by_elo(
+    opponent_pool: List[Opponent],
+    elo: "Elo",
+    rng: np.random.Generator,
+    current_name: str = "current",
+    p_use_latest_snapshot: float = 0.5,
+    elo_tau: float = 200.0,
+    strong_bias: float = 0.30,
+    strong_scale: float = 200.0,
+) -> Opponent:
+    """
+    Mixture:
+      - with prob p_use_latest_snapshot: pick latest (keeps 'moving target' pressure)
+      - else: Elo-weighted sampling around current, with slight bias toward stronger opponents.
+    """
+    assert len(opponent_pool) >= 1
+    if len(opponent_pool) == 1 or rng.random() < p_use_latest_snapshot:
+        return opponent_pool[-1]
+
+    e_cur = float(elo.get(current_name))
+    weights = []
+    for opp in opponent_pool:
+        e = float(elo.get(opp.name))
+        d = e - e_cur
+        closeness = math.exp(-abs(d) / max(1e-6, float(elo_tau)))
+        # push a bit toward stronger (d > 0)
+        stronger = _sigmoid(d / max(1e-6, float(strong_scale)))
+        w = closeness * (1.0 + float(strong_bias) * stronger)
+        weights.append(w)
+    wsum = sum(weights)
+    if not (wsum > 0.0) or not math.isfinite(wsum):
+        # fallback: uniform
+        return random.choice(opponent_pool)
+    probs = np.array(weights, dtype=np.float64) / wsum
+    idx = int(rng.choice(len(opponent_pool), p=probs))
+    return opponent_pool[idx]
+
 
 def collect_rollouts(
     model: nn.Module,
     opponent_pool: List[Opponent],
+    elo: "Elo",
     device: torch.device,
     rollout_steps: int = 4096,
     n_envs: int = 16,
@@ -541,6 +583,9 @@ def collect_rollouts(
     micro_win_reward: float = 0.0,
     p_vs_random: float = 0.2,
     p_use_latest_snapshot: float = 0.5,
+    elo_tau: float = 200.0,
+    strong_bias: float = 0.30,
+    strong_scale: float = 200.0,
 ) -> Tuple[List[Transition], Dict[str, float]]:
     """
     Collect rollouts from the perspective of the learning policy only.
@@ -551,7 +596,10 @@ def collect_rollouts(
     rng = np.random.default_rng()
 
     transitions: List[Transition] = []
-    stats = {"episodes": 0.0, "wins": 0.0, "losses": 0.0, "draws": 0.0}
+    stats = {
+        "episodes": 0.0, "wins": 0.0, "losses": 0.0, "draws": 0.0,
+        "opp_elo_mean": 0.0, "opp_elo_count": 0.0, "opp_stronger_frac": 0.0,
+    }
 
     # init
     env_state = []
@@ -577,15 +625,27 @@ def collect_rollouts(
                 env.opponent_is_random = (rng.random() < p_vs_random)
                 if env.opponent_is_random:
                     env.opponent_model = None
+                    env.opponent_name = "random"
                 else:
-                    # League mix: 50% latest snapshot + 50% uniform in pool
-                    if len(opponent_pool) == 1:
-                        env.opponent_model = opponent_pool[0]
-                    else:
-                        if rng.random() < p_use_latest_snapshot:
-                            env.opponent_model = opponent_pool[-1]
-                        else:
-                            env.opponent_model = random.choice(opponent_pool)
+                    opp = sample_opponent_by_elo(
+                        opponent_pool=opponent_pool,
+                        elo=elo,
+                        rng=rng,
+                        current_name="current",
+                        p_use_latest_snapshot=p_use_latest_snapshot,
+                        elo_tau=elo_tau,
+                        strong_bias=strong_bias,
+                        strong_scale=strong_scale,
+                    )
+                    env.opponent_model = opp.model
+                    env.opponent_name = opp.name
+
+                # rollout diagnostics: opponent elo
+                e_cur = float(elo.get("current"))
+                e_opp = float(elo.get(env.opponent_name))
+                stats["opp_elo_mean"] += e_opp
+                stats["opp_elo_count"] += 1.0
+                stats["opp_stronger_frac"] += 1.0 if (e_opp > e_cur) else 0.0
                 env._episode_fresh = False
 
             # Play until it's learning policy's turn OR terminal,
@@ -676,6 +736,9 @@ def collect_rollouts(
     stats["win_rate"] = stats["wins"] / eps
     stats["loss_rate"] = stats["losses"] / eps
     stats["draw_rate"] = stats["draws"] / eps
+    if stats["opp_elo_count"] > 0:
+        stats["opp_elo_mean"] /= stats["opp_elo_count"]
+        stats["opp_stronger_frac"] /= stats["opp_elo_count"]
     return transitions, stats
 
 
@@ -1077,6 +1140,7 @@ def train(
         transitions, roll_stats = collect_rollouts(
             model=model,
             opponent_pool=opponent_pool,
+            elo=elo,
             device=device,
             rollout_steps=rollout_steps,
             n_envs=n_envs,
@@ -1084,6 +1148,9 @@ def train(
             micro_win_reward=micro_reward_used,
             p_vs_random=cur.p_vs_random,
             p_use_latest_snapshot=p_latest,
+            elo_tau=200.0,
+            strong_bias=0.30,
+            strong_scale=200.0,
         )
 
         # Compute GAE
@@ -1132,6 +1199,8 @@ def train(
         writer.add_scalar("rollout/win_rate", roll_stats["win_rate"], upd)
         writer.add_scalar("rollout/draw_rate", roll_stats["draw_rate"], upd)
         writer.add_scalar("rollout/loss_rate", roll_stats["loss_rate"], upd)
+        writer.add_scalar("rollout/opp_elo_mean", roll_stats.get("opp_elo_mean", 0.0), upd)
+        writer.add_scalar("rollout/opp_stronger_frac", roll_stats.get("opp_stronger_frac", 0.0), upd)
         writer.add_scalar("rollout/episodes", roll_stats["episodes"], upd)
         writer.add_scalar("train/pi_loss", upd_stats["pi_loss"], upd)
         writer.add_scalar("train/v_loss", upd_stats["v_loss"], upd)
