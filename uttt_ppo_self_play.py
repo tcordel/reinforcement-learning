@@ -488,6 +488,11 @@ class Transition:
     next_obs: torch.Tensor   # (C,9,9) CPU
     next_mask: torch.Tensor  # (81,) bool CPU
 
+@dataclass
+class Opponent:
+    name: str
+    model: nn.Module
+
 
 def obs_to_torch(o: Dict, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     x = torch.from_numpy(o["obs"]).to(device=device, dtype=torch.float32)  # (C,9,9)
@@ -528,7 +533,7 @@ def act_random(mask: np.ndarray, rng: np.random.Generator) -> int:
 
 def collect_rollouts(
     model: nn.Module,
-    opponent_pool: List[nn.Module],
+    opponent_pool: List[Opponent],
     device: torch.device,
     rollout_steps: int = 4096,
     n_envs: int = 16,
@@ -914,12 +919,19 @@ class Elo:
         self.ratings: Dict[str, float] = {}
 
     def get(self, name: str) -> float:
+        # Random is a fixed 1000 reference (never moves)
+        if name == "random":
+            return 1000.0
         return self.ratings.get(name, 1000.0)
 
     def expected(self, ra: float, rb: float) -> float:
         return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
 
     def update(self, a: str, b: str, score_a: float):
+        # Keep "random" capped at 1000: we don't update its rating at all.
+        # (We still allow updating the other side.)
+        lock_b = (b == "random")
+        lock_a = (a == "random")
         # score_a: 1 win, 0 draw, -1 loss -> convert to [0,1]
         sa = 0.5 if score_a == 0 else (1.0 if score_a > 0 else 0.0)
         ra, rb = self.get(a), self.get(b)
@@ -927,8 +939,10 @@ class Elo:
         eb = 1.0 - ea
         ra2 = ra + self.k * (sa - ea)
         rb2 = rb + self.k * ((1.0 - sa) - eb)
-        self.ratings[a] = ra2
-        self.ratings[b] = rb2
+        if not lock_a:
+            self.ratings[a] = ra2
+        if not lock_b:
+            self.ratings[b] = rb2
 
 
 # ============================================================
@@ -991,15 +1005,17 @@ def train(
     prev_entropy: Optional[float] = None
 
     # opponent pool (snapshots)
-    opponent_pool: List[nn.Module] = []
+    opponent_pool: List[Opponent] = []
     snap0 = copy.deepcopy(model).to(device)
     snap0.eval()
-    opponent_pool.append(snap0)
+    opponent_pool.append(Opponent(name="snap_000000", model=snap0))
 
     elo = Elo(k=16.0)
+    elo.ratings["current"] = 1000.0
     # "champion" best-so-far (frozen)
-    best_model = copy.deepcopy(model).to(device)
-    best_model.eval()
+    champion_model = copy.deepcopy(model).to(device)
+    champion_model.eval()
+    best = Opponent(name="origin", model=champion_model)
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
@@ -1152,9 +1168,9 @@ def train(
             # here we evaluate via play_match(current vs best_snapshot) + custom random matches separately.
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             last_snap = opponent_pool[-1]
-            eval_vs_snap = play_match(model, last_snap, device, n_games=80, temperature=0.1, deterministic=True)
+            eval_vs_snap = play_match(model, last_snap.model, device, n_games=80, temperature=0.1, deterministic=True)
 
-            eval_vs_best = play_match(model, best_model, device, n_games=80, temperature=0.1, deterministic=True)
+            eval_vs_best = play_match(model, best.model, device, n_games=80, temperature=0.1, deterministic=True)
             writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
             writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
             writer.add_scalar("eval/vs_champion_loss", eval_vs_best["loss_rate"], upd)
@@ -1210,12 +1226,19 @@ def train(
                 phase_start_upd = upd
 
 
-            # Update a very simple Elo between "current" and "best_snapshot"
-            # Score based on win/draw/loss of current vs snapshot.
-            # Convert rates to expected mean score in {-1,0,1} then update once.
-            mean_score = eval_vs_snap["win_rate"] - eval_vs_snap["loss_rate"]
-            elo.update("current", "snapshot_best", mean_score)
+            def update_elo(eval, opp_name):
+                # Update a very simple Elo between "current" and "best_snapshot"
+                # Score based on win/draw/loss of current vs snapshot.
+                # Convert rates to expected mean score in {-1,0,1} then update once.
+                mean_score = eval["win_rate"] - eval["loss_rate"]
+                elo.update("current", opp_name, mean_score)
+
+            update_elo(eval_vs_snap, last_snap.name)
+            update_elo(eval_vs_random, "random")
+            update_elo(eval_vs_best, best.name)
+
             writer.add_scalar("eval/elo_current", elo.get("current"), upd)
+            writer.add_scalar("eval/elo_best", elo.get(best.name), upd)
 
             print(
                 f"[upd={upd:05d}] "
@@ -1223,6 +1246,8 @@ def train(
                 f"evalR win={eval_vs_random['win_rate']:.2f} "
                 f"evalS(last) win={eval_vs_snap['win_rate']:.2f} "
                 f"evalC win={eval_vs_best['win_rate']:.2f} "
+                f"elo={elo.get('current'):.0f} "
+                f"opp={elo.get(best.name):.0f} "
                 f"KL={upd_stats['approx_kl']:.4f} ent={upd_stats['entropy']:.3f} EV={upd_stats['explained_variance']:.2f}"
             )
 
@@ -1231,6 +1256,7 @@ def train(
             if eval_vs_best["win_rate"] - eval_vs_best["loss_rate"] >= 0.10:
                 best_model = copy.deepcopy(model).to(device)
                 best_model.eval()
+                best = Opponent(name=f"snap_{upd:05d}", model=best_model)
                 writer.add_scalar("eval/champion_promoted", 1.0, upd)
             else:
                 writer.add_scalar("eval/champion_promoted", 0.0, upd)
@@ -1239,7 +1265,7 @@ def train(
         if upd % snapshot_interval == 0:
             snap = copy.deepcopy(model).to(device)
             snap.eval()
-            opponent_pool.append(snap)
+            opponent_pool.append(Opponent(name=f"snap_{upd:05d}", model=snap))
             if len(opponent_pool) > max_pool:
                 opponent_pool.pop(0)
 
