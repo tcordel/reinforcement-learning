@@ -1200,6 +1200,8 @@ def train(
 
     model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    if os.path.exists("./uttt-load.pth"):
+        model.load_state_dict(torch.load("./uttt-load.pth", map_location="cpu"))
 
      # --- Adaptive control to avoid "always early-stop" late in phase B
     early_stop_ema = 0.0
