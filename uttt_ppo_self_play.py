@@ -1151,10 +1151,6 @@ class Elo:
         return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
 
     def update(self, a: str, b: str, score_a: float):
-        # Keep "random" capped at 1000: we don't update its rating at all.
-        # (We still allow updating the other side.)
-        lock_b = (b == "random")
-        lock_a = (a == "random")
         # score_a: 1 win, 0 draw, -1 loss -> convert to [0,1]
         sa = 0.5 if score_a == 0 else (1.0 if score_a > 0 else 0.0)
         ra, rb = self.get(a), self.get(b)
@@ -1162,10 +1158,8 @@ class Elo:
         eb = 1.0 - ea
         ra2 = ra + self.k * (sa - ea)
         rb2 = rb + self.k * ((1.0 - sa) - eb)
-        if not lock_a:
-            self.ratings[a] = ra2
-        if not lock_b:
-            self.ratings[b] = rb2
+        self.ratings[a] = ra2
+        self.ratings[b] = rb2
 
 
 # ============================================================
@@ -1494,6 +1488,7 @@ def train(
 
             writer.add_scalar("eval/elo_current", elo.get("current"), upd)
             writer.add_scalar("eval/elo_best", elo.get(best.name), upd)
+            writer.add_scalar("eval/elo_random", elo.get("random"), upd)
 
             print(
                 f"[upd={upd:05d}] "
@@ -1503,6 +1498,7 @@ def train(
                 f"evalC win={eval_vs_best['win_rate']:.2f} "
                 f"elo={elo.get('current'):.0f} "
                 f"opp={elo.get(best.name):.0f} "
+                f"random={elo.get('random'):.0f} "
                 f"KL={upd_stats['approx_kl']:.4f} ent={upd_stats['entropy']:.3f} EV={upd_stats['explained_variance']:.2f}"
             )
 
@@ -1525,7 +1521,7 @@ def train(
                 opponent_pool.pop(0)
 
     writer.close()
-    torch.save(model.state_dict(), f"./uttt-final.pth")
+    torch.save(model.state_dict(), "./uttt-final.pth")
     return model
 
 
