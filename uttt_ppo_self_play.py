@@ -662,8 +662,8 @@ def _augment_symmetries(
         # masks: m2[:, perm[k, a_old]] = masks[:, a_old]
         m2 = torch.zeros_like(masks)
         idx = perm[k].view(1, 81).expand(N, 81)
-        m2.scatter_(1, idx, masks.to(torch.uint8))
-        m_k = m2.bool()
+        m2.scatter_(1, idx, masks)    # bool -> bool
+        m_k = m2
 
         # actions: a_new = perm[k, a_old]
         a_k = perm[k][actions]
@@ -1649,7 +1649,7 @@ def train(
 
 
 if __name__ == "__main__":
-    port = 8081
+    port = 8080
     server = start_live_hp_server(host="127.0.0.1", port=port)
     print(f"Live HP server on http://127.0.0.1:{port}")
     # Preset auto CPU/GPU:
