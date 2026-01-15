@@ -1459,6 +1459,20 @@ def train(
         obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
             obs, masks, actions, logp_old, returns, adv
         )
+        # IMPORTANT (PPO correctness):
+        # After symmetry augmentation, (obs, action) changed, so the stored logp_old
+        # from the original rollout is no longer valid. Recompute it with the current
+        # model (pre-update) on the augmented batch.
+        with torch.no_grad():
+            logits, _ = model(obs)
+            logits = logits / max(temperature, 1e-6)
+            logits = masked_logits(logits, masks)
+            dist = Categorical(logits=logits)
+            logp_old = dist.log_prob(actions)
+
+        # Keep roughly the same number of minibatches per epoch as before augmentation.
+        mb_size = min(512 * 8, int(obs.shape[0]))
+
 
         # PPO update
         model.train()
@@ -1475,7 +1489,7 @@ def train(
             vf_coef=0.5,
             ent_coef=ent_coef_used,
             epochs=ppo_epochs_used,
-            minibatch_size=512,
+            minibatch_size=mb_size,
             value_clip=0.2,
             use_amp=use_amp,
             scaler=scaler,
