@@ -431,7 +431,14 @@ class UTTTEnv:
             self.winner = self.current_player
         elif np.all(self.micro_status != 0):
             self.done = True
-            self.winner = 0
+            current_player_wins = len(self.micro_status[self.micro_status == self.current_player])
+            opp_player_wins = len(self.micro_status[self.micro_status == -self.current_player])
+            if current_player_wins > opp_player_wins:
+                self.winner = self.current_player
+            elif opp_player_wins > current_player_wins:
+                self.winner = -self.current_player
+            else:
+                self.winner = 0
         else:
             self.done = False
             self.winner = None
@@ -1664,8 +1671,8 @@ def train(
 
 if __name__ == "__main__":
     port = 8080
-    server = start_live_hp_server(host="127.0.0.1", port=port)
-    print(f"Live HP server on http://127.0.0.1:{port}")
+    server = start_live_hp_server(host="0.0.0.0", port=port)
+    print(f"Live HP server on http://0.0.0.0:{port}")
     # Preset auto CPU/GPU:
     if torch.cuda.is_available():
         # GPU 1550 : update plus rapide -> batch plus gros + réseau moyen
