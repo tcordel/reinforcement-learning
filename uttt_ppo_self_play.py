@@ -999,7 +999,7 @@ def collect_rollouts(
                 stats["wins"] += 1.0 if final_r > 0 else 0.0
                 stats["losses"] += 1.0 if final_r < 0 else 0.0
                 stats["draws"] += 1.0 if final_r == 0 else 0.0
-                elo.update("current", env.opponent_name, score)
+                elo.update("current", env.opponent_name, final_r)
                 env._episode_fresh = True
 
             total_r = float(shaping_r + final_r)
@@ -1523,6 +1523,7 @@ def train(
             dist = Categorical(logits=logits)
             logp_old = dist.log_prob(actions)
 
+        mb_size = min(512 * 8, int(obs.shape[0]))
         # Keep the number of minibatches per epoch roughly constant even if N changes
         # (e.g. symmetry augmentation, different rollout lengths, etc.)
         N = int(obs.shape[0])
