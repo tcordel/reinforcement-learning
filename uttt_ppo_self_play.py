@@ -429,19 +429,26 @@ class UTTTEnv:
         if _check_macro_win(self.micro_status, self.current_player):
             self.done = True
             self.winner = self.current_player
-        elif np.all(self.micro_status != 0):
-            self.done = True
-            current_player_wins = len(self.micro_status[self.micro_status == self.current_player])
-            opp_player_wins = len(self.micro_status[self.micro_status == -self.current_player])
-            if current_player_wins > opp_player_wins:
-                self.winner = self.current_player
-            elif opp_player_wins > current_player_wins:
-                self.winner = -self.current_player
-            else:
-                self.winner = 0
         else:
             self.done = False
-            self.winner = None
+            # If the game is blocked (no legal moves) or fully resolved (all microboards finished),
+            # apply your tie-break rule: winner is the player with more microboards won.
+            # IMPORTANT: this must NOT depend on current_player.
+            no_moves = (not self._legal_mask().any())
+            all_done = bool(np.all(self.micro_status != 0))
+            if no_moves or all_done:
+                x_wins = int(np.sum(self.micro_status == 1))
+                o_wins = int(np.sum(self.micro_status == -1))
+                if x_wins > o_wins:
+                    self.winner = 1
+                elif o_wins > x_wins:
+                    self.winner = -1
+                else:
+                    self.winner = 0
+                self.done = True
+            else:
+                self.done = False
+                self.winner = None
 
         # next_board is determined by local cell inside the microboard we played
         # BUT if that target microboard is already finished, next player can play anywhere.
@@ -992,6 +999,7 @@ def collect_rollouts(
                 stats["wins"] += 1.0 if final_r > 0 else 0.0
                 stats["losses"] += 1.0 if final_r < 0 else 0.0
                 stats["draws"] += 1.0 if final_r == 0 else 0.0
+                elo.update("current", env.opponent_name, score)
                 env._episode_fresh = True
 
             total_r = float(shaping_r + final_r)
@@ -1284,7 +1292,33 @@ class Elo:
 
     def update(self, a: str, b: str, score_a: float):
         # score_a: 1 win, 0 draw, -1 loss -> convert to [0,1]
-        sa = 0.5 if score_a == 0 else (1.0 if score_a > 0 else 0.0)
+        """
+        score_a is from A's perspective, in [-1, 1]:
+          +1 = win, 0 = draw, -1 = loss
+        We also accept averaged scores (e.g. win_rate - loss_rate).
+        'random' is a fixed 1000 reference.
+        """
+        s = float(score_a)
+        if not math.isfinite(s):
+            return
+        s = max(-1.0, min(1.0, s))
+        sa = 0.5 * (s + 1.0)  # map [-1,1] -> [0,1]
+
+        # Keep random fixed at 1000: update only the non-random side
+        if a == "random" and b == "random":
+            return
+        if b == "random" and a != "random":
+            ra = self.get(a)
+            ea = self.expected(ra, 1000.0)
+            self.ratings[a] = ra + self.k * (sa - ea)
+            return
+        if a == "random" and b != "random":
+            rb = self.get(b)
+            eb = self.expected(rb, 1000.0)
+            sb = 1.0 - sa
+            self.ratings[b] = rb + self.k * (sb - eb)
+            return
+
         ra, rb = self.get(a), self.get(b)
         ea = self.expected(ra, rb)
         eb = 1.0 - ea
@@ -1457,11 +1491,11 @@ def train(
             n_envs=n_envs,
             temperature=temperature,
             micro_win_reward=micro_reward_used,
-            p_vs_random=cur.p_vs_random,
-            p_use_latest_snapshot=p_latest,
-            elo_tau=200.0,
-            strong_bias=0.30,
-            strong_scale=200.0,
+            p_vs_random=p_vs_random_used,
+            p_use_latest_snapshot=p_latest_used,
+            elo_tau=elo_tau_used,
+            strong_bias=strong_bias_used,
+            strong_scale=strong_scale_used,
         )
 
         # Compute GAE
@@ -1541,6 +1575,7 @@ def train(
         writer.add_scalar("rollout/draw_rate", roll_stats["draw_rate"], upd)
         writer.add_scalar("rollout/loss_rate", roll_stats["loss_rate"], upd)
         writer.add_scalar("rollout/opp_elo_mean", roll_stats.get("opp_elo_mean", 0.0), upd)
+        writer.add_scalar("rollout/opp_delta_elo_mean", roll_stats.get("opp_elo_mean", 0.0) - elo.get("current"), upd)
         writer.add_scalar("rollout/opp_stronger_frac", roll_stats.get("opp_stronger_frac", 0.0), upd)
         writer.add_scalar("rollout/episodes", roll_stats["episodes"], upd)
         writer.add_scalar("train/pi_loss", upd_stats["pi_loss"], upd)
