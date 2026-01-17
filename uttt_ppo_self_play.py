@@ -342,7 +342,7 @@ class UTTTEnv:
 
         self.board.fill(0)
         self.micro_status.fill(0)
-        self.current_player = 1 if self.rng.integers(0, 2) == 0 else -1
+        self.current_player = 1
         self.next_board = -1
         self.done = False
         self.winner = None
@@ -952,6 +952,9 @@ def collect_rollouts(
                 stats["wins"] += 1.0 if score > 0 else 0.0
                 stats["losses"] += 1.0 if score < 0 else 0.0
                 stats["draws"] += 1.0 if score == 0 else 0.0
+                # Update Elo using real game outcome (dense, low-variance signal)
+                # This keeps ratings meaningful for ALL snapshots in the pool.
+                elo.update("current", env.opponent_name, score)
                 env._episode_fresh = True
                 continue
 
@@ -1099,6 +1102,8 @@ def ppo_update(
     use_amp: bool = False,
     scaler: Optional[GradScaler] = None,
     target_kl: float = 0.03,
+    kl_stop_factor: float = 2.5,
+    stop_on_mb_kl: bool = True,
     temperature: float = 1.0,
     upd: int = 0,
 ) -> Dict[str, float]:
@@ -1170,6 +1175,9 @@ def ppo_update(
                 max_kl = max(max_kl, akl)
                 epoch_kl_sum += akl
                 epoch_kl_n += 1
+                if stop_on_mb_kl and (akl > float(target_kl) * float(kl_stop_factor)):
+                    early_stop = True
+                    break
 
             total_pi_loss += float(pi_loss.item())
             total_v_loss += float(v_loss.item())
@@ -1177,10 +1185,12 @@ def ppo_update(
             total_kl += akl
             total_clipfrac += float(clipfrac.item())
             n_updates += 1
+            if early_stop:
+                break
             
         # Epoch-level KL early stop (standard PPO behavior)
         epoch_kl_mean = epoch_kl_sum / max(epoch_kl_n, 1)
-        if epoch_kl_mean > target_kl:
+        if epoch_kl_mean > float(target_kl) * float(kl_stop_factor):
             early_stop = True
             break
 
@@ -1349,14 +1359,16 @@ def train(
     opponent_pool: List[Opponent] = []
     snap0 = copy.deepcopy(model).to(device)
     snap0.eval()
-    opponent_pool.append(Opponent(name="snap_000000", model=snap0))
+    best = Opponent(name="snap_000000", model=snap0)
+    opponent_pool.append(best)
 
     elo = Elo(k=16.0)
     elo.ratings["current"] = 1000.0
-    # "champion" best-so-far (frozen)
-    champion_model = copy.deepcopy(model).to(device)
-    champion_model.eval()
-    best = Opponent(name="origin", model=champion_model)
+    elo.ratings[best.name] = elo.get("current")
+
+    champion_margin = 0.10
+    champion_needed_streak = 3
+    champion_streak = 0
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
@@ -1377,14 +1389,14 @@ def train(
             ppo_epochs_used = 4
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
-            target_kl_used = 0.04
+            target_kl_used = 0.10
             p_latest = 0.70
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
             ppo_epochs_used = 3 if early_stop_ema < 0.35 else 2
         else:
-            target_kl_used = 0.04
+            target_kl_used = 0.10
             p_latest = 0.80
             ppo_epochs_used = 2
 
@@ -1477,8 +1489,15 @@ def train(
             dist = Categorical(logits=logits)
             logp_old = dist.log_prob(actions)
 
-        # Keep roughly the same number of minibatches per epoch as before augmentation.
-        mb_size = min(512 * 8, int(obs.shape[0]))
+        # Keep the number of minibatches per epoch roughly constant even if N changes
+        # (e.g. symmetry augmentation, different rollout lengths, etc.)
+        N = int(obs.shape[0])
+        target_minibatches_per_epoch = 8
+        mb_size = (N + target_minibatches_per_epoch - 1) // target_minibatches_per_epoch
+        if N >= 512:
+            mb_size = max(512, mb_size)
+        mb_size = max(256, mb_size)
+        mb_size = min(mb_size, N)
 
 
         # PPO update
@@ -1502,15 +1521,18 @@ def train(
             scaler=scaler,
             target_kl=target_kl_used,
             temperature=temperature,
-            upd=upd
+            upd=upd,
+            kl_stop_factor=2.5,
+            stop_on_mb_kl=True,
         )
         prev_entropy = float(upd_stats["entropy"])
 
         # Update EMA early-stop and adapt LR if we are constantly on the KL limiter
         early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
-        # If we keep early-stopping, decay LR gently to get out of the "butée"
-        if curriculum.phase != "A" and early_stop_ema > 0.60:
-            _set_lr(0.98)
+        # Avoid collapsing LR to the floor: prefer fixing KL/batch rather than decaying every update.
+        # Only apply a mild decay if we are *extremely* often on the KL limiter for a long time.
+        if curriculum.phase != "A" and early_stop_ema > 0.90 and (upd % 200 == 0):
+            _set_lr(0.95)
 
         if upd > 0 and upd % eval_interval == 0:
             torch.save(model.state_dict(), f"./uttt-{upd}.pth")
@@ -1646,12 +1668,22 @@ def train(
                 f"KL={upd_stats['approx_kl']:.4f} ent={upd_stats['entropy']:.3f} EV={upd_stats['explained_variance']:.2f}"
             )
 
-            # Promote to champion if current consistently beats champion
-            # (threshold can be tuned; keep it conservative to avoid oscillations)
-            if eval_vs_best["win_rate"] - eval_vs_best["loss_rate"] >= 0.10:
+            # Promote to champion only after several consecutive positive evaluations
+            champion_margin_obs = float(eval_vs_best["win_rate"] - eval_vs_best["loss_rate"])
+            if champion_margin_obs >= champion_margin:
+                champion_streak += 1
+            else:
+                champion_streak = 0
+
+            writer.add_scalar("eval/champion_margin", champion_margin_obs, upd)
+            writer.add_scalar("eval/champion_streak", float(champion_streak), upd)
+
+            if champion_streak >= champion_needed_streak:
                 best_model = copy.deepcopy(model).to(device)
                 best_model.eval()
                 best = Opponent(name=f"snap_{upd:05d}", model=best_model)
+                elo.ratings[best.name] = elo.get("current")
+                champion_streak = 0
                 writer.add_scalar("eval/champion_promoted", 1.0, upd)
             else:
                 writer.add_scalar("eval/champion_promoted", 0.0, upd)
@@ -1660,7 +1692,9 @@ def train(
         if upd % snapshot_interval == 0:
             snap = copy.deepcopy(model).to(device)
             snap.eval()
-            opponent_pool.append(Opponent(name=f"snap_{upd:05d}", model=snap))
+            snap_op = Opponent(name=f"snap_{upd:05d}", model=snap)
+            opponent_pool.append(snap_op)
+            elo.ratings[snap_op.name] = elo.get("current")
             if len(opponent_pool) > max_pool:
                 opponent_pool.pop(0)
 
