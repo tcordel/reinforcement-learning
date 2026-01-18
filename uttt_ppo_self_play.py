@@ -809,6 +809,12 @@ def act(model: nn.Module, x: torch.Tensor, m: torch.Tensor, temperature: float) 
     logits, v = model(x.unsqueeze(0))    # (1,81), (1,)
     logits = logits / max(temperature, 1e-6)
     logits = masked_logits(logits, m.unsqueeze(0))
+
+    # Guards: if mask invalid or logits non-finite, fail fast with a clear message
+    if not m.any():
+        raise RuntimeError("act(): action mask has no legal moves (mask all-false)")
+    if not torch.isfinite(logits).all():
+        raise RuntimeError("act(): non-finite logits (model likely diverged)")
     dist = Categorical(logits=logits)
     a = int(dist.sample().item())
     logp = float(dist.log_prob(torch.tensor([a], device=x.device)).item())
@@ -1116,6 +1122,16 @@ def ppo_update(
     upd: int = 0,
 ) -> Dict[str, float]:
     N = obs.shape[0]
+
+    # --- Basic numeric guards ---
+    if (not torch.isfinite(adv).all()) or (not torch.isfinite(returns).all()):
+        raise RuntimeError("Non-finite adv/returns entering PPO")
+
+    adv_mean = adv.mean()
+    adv_std = adv.std(unbiased=False)
+    if (not torch.isfinite(adv_mean)) or (not torch.isfinite(adv_std)) or (adv_std.item() < 1e-12):
+        raise RuntimeError(f"Bad advantage stats: mean={float(adv_mean)}, std={float(adv_std)}")
+
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
     # metrics accum
@@ -1145,6 +1161,8 @@ def ppo_update(
                 logits, v = model(obs[mb])
                 logits = logits / max(temperature, 1e-6)
                 logits = masked_logits(logits, masks[mb])
+                if not torch.isfinite(logits).all():
+                    raise RuntimeError("Non-finite logits produced in PPO forward pass")
                 dist = Categorical(logits=logits)
 
                 new_logp = dist.log_prob(actions[mb])
@@ -1162,18 +1180,19 @@ def ppo_update(
                 v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
                 loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
-
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Non-finite loss in PPO update")
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
                 assert scaler is not None
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 optimizer.step()
 
             with torch.no_grad():
@@ -1535,6 +1554,27 @@ def train(
         mb_size = min(mb_size, N)
 
 
+        # --- Stable minibatch sizing ---
+        # Keep ~8 minibatches/epoch, but cap to avoid overly large steps (NaN risk).
+        N = int(obs.shape[0])
+        target_minibatches = 8
+        mb_size = (N + target_minibatches - 1) // target_minibatches
+        mb_size = max(512, mb_size) if N >= 512 else N
+        mb_size = min(mb_size, 1024)  # hard cap (important for stability)
+        mb_size = min(mb_size, N)
+
+        # --- LR scaling with minibatch size ---
+        # If you increase mb_size, reduce LR proportionally to keep update magnitude stable.
+        # Reference: 512 as baseline.
+        base_lr = float(optimizer.param_groups[0]["lr"])
+        lr_scale = 512.0 / float(mb_size)
+        lr_scaled = base_lr * lr_scale
+        # Optional floor to avoid collapsing to ~0:
+        lr_floor = 1e-5
+        lr_scaled = max(lr_floor, lr_scaled)
+        for g in optimizer.param_groups:
+            g["lr"] = lr_scaled
+
         # PPO update
         model.train()
         upd_stats = ppo_update(
@@ -1561,6 +1601,8 @@ def train(
             stop_on_mb_kl=True,
         )
         prev_entropy = float(upd_stats["entropy"])
+        for g in optimizer.param_groups:
+            g["lr"] = base_lr
 
         # Update EMA early-stop and adapt LR if we are constantly on the KL limiter
         early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
