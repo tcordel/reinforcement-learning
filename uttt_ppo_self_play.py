@@ -1133,6 +1133,7 @@ def ppo_update(
         raise RuntimeError(f"Bad advantage stats: mean={float(adv_mean)}, std={float(adv_std)}")
 
     adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+    adv = adv.clamp(-5.0, 5.0)
 
     # metrics accum
     total_pi_loss = 0.0
@@ -1215,10 +1216,6 @@ def ppo_update(
                 max_kl = max(max_kl, akl)
                 epoch_kl_sum += akl
                 epoch_kl_n += 1
-                if stop_on_mb_kl and (akl > float(target_kl) * float(kl_stop_factor)):
-                    early_stop = True
-                    break
-
                 # ---- minibatch-level KL stop (critical) ----
                 if stop_on_mb_kl and (akl > kl_limit):
                     early_stop = True
@@ -1235,7 +1232,7 @@ def ppo_update(
             
         # Epoch-level KL early stop (standard PPO behavior)
         epoch_kl_mean = epoch_kl_sum / max(epoch_kl_n, 1)
-        if epoch_kl_mean > float(target_kl) * float(kl_stop_factor):
+        if epoch_kl_mean > float(target_kl):
             early_stop = True
             break
 
@@ -1457,7 +1454,7 @@ def train(
         if curriculum.phase == "A":
             target_kl_used = 0.03
             p_latest = 0.50
-            ppo_epochs_used = 4
+            ppo_epochs_used = 1
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
             target_kl_used = 0.04
@@ -1597,7 +1594,7 @@ def train(
                 logp_old=logp_old,
                 returns=returns,
                 adv=adv,
-                clip_eps=0.15,
+                clip_eps=0.10,
                 vf_coef=0.25,
                 ent_coef=ent_coef_used,
                 epochs=ppo_epochs_used,
@@ -1831,7 +1828,7 @@ if __name__ == "__main__":
             total_updates=100000,
             rollout_steps=2048,
             n_envs=8,
-            lr=3e-4,
+            lr=5e-5,
             gamma=0.99,
             lam=0.95,
             temperature_start=1.3,
