@@ -1143,6 +1143,7 @@ def ppo_update(
     n_updates = 0
     early_stop = False
     max_kl = 0.0
+    kl_limit = float(target_kl) * float(kl_stop_factor)
 
     # cache old values for value clipping
     with torch.no_grad():
@@ -1188,12 +1189,24 @@ def ppo_update(
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                for p in model.parameters():
+                    if p.grad is not None and (not torch.isfinite(p.grad).all()):
+                        raise RuntimeError("Non-finite gradients before optimizer step (AMP)")
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                for p in model.parameters():
+                    if p.grad is not None and (not torch.isfinite(p.grad).all()):
+                        raise RuntimeError("Non-finite gradients before optimizer step")
                 optimizer.step()
+
+            # parameters must remain finite after step
+            with torch.no_grad():
+                for p in model.parameters():
+                    if not torch.isfinite(p).all():
+                        raise RuntimeError("Non-finite parameters after optimizer step")
 
             with torch.no_grad():
                 approx_kl = (logp_old[mb] - new_logp).mean()
@@ -1203,6 +1216,11 @@ def ppo_update(
                 epoch_kl_sum += akl
                 epoch_kl_n += 1
                 if stop_on_mb_kl and (akl > float(target_kl) * float(kl_stop_factor)):
+                    early_stop = True
+                    break
+
+                # ---- minibatch-level KL stop (critical) ----
+                if stop_on_mb_kl and (akl > kl_limit):
                     early_stop = True
                     break
 
@@ -1442,16 +1460,16 @@ def train(
             ppo_epochs_used = 4
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
-            target_kl_used = 0.10
+            target_kl_used = 0.04
             p_latest = 0.70
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
-            ppo_epochs_used = 3 if early_stop_ema < 0.35 else 2
+            ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
         else:
-            target_kl_used = 0.10
+            target_kl_used = 0.04
             p_latest = 0.80
-            ppo_epochs_used = 2
+            ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
 
         # Shaping schedule:
         # - Phase A: keep shaping constant to reliably beat random
@@ -1542,67 +1560,66 @@ def train(
             dist = Categorical(logits=logits)
             logp_old = dist.log_prob(actions)
 
-        mb_size = min(512 * 8, int(obs.shape[0]))
-        # Keep the number of minibatches per epoch roughly constant even if N changes
-        # (e.g. symmetry augmentation, different rollout lengths, etc.)
-        N = int(obs.shape[0])
-        target_minibatches_per_epoch = 8
-        mb_size = (N + target_minibatches_per_epoch - 1) // target_minibatches_per_epoch
-        if N >= 512:
-            mb_size = max(512, mb_size)
-        mb_size = max(256, mb_size)
-        mb_size = min(mb_size, N)
-
-
-        # --- Stable minibatch sizing ---
-        # Keep ~8 minibatches/epoch, but cap to avoid overly large steps (NaN risk).
-        N = int(obs.shape[0])
-        target_minibatches = 8
-        mb_size = (N + target_minibatches - 1) // target_minibatches
-        mb_size = max(512, mb_size) if N >= 512 else N
-        mb_size = min(mb_size, 1024)  # hard cap (important for stability)
-        mb_size = min(mb_size, N)
-
-        # --- LR scaling with minibatch size ---
-        # If you increase mb_size, reduce LR proportionally to keep update magnitude stable.
-        # Reference: 512 as baseline.
-        base_lr = float(optimizer.param_groups[0]["lr"])
-        lr_scale = 512.0 / float(mb_size)
-        lr_scaled = base_lr * lr_scale
-        # Optional floor to avoid collapsing to ~0:
-        lr_floor = 1e-5
-        lr_scaled = max(lr_floor, lr_scaled)
-        for g in optimizer.param_groups:
-            g["lr"] = lr_scaled
+        # mb_size = min(512 * 8, int(obs.shape[0]))
+        #
+        # # --- Stable minibatch sizing ---
+        # # Keep ~8 minibatches/epoch, but cap to avoid overly large steps (NaN risk).
+        # N = int(obs.shape[0])
+        # target_minibatches = 8
+        # mb_size = (N + target_minibatches - 1) // target_minibatches
+        # mb_size = max(512, mb_size) if N >= 512 else N
+        # mb_size = min(mb_size, 1024)  # hard cap (important for stability)
+        # mb_size = min(mb_size, N)
+        #
+        # # --- LR scaling with minibatch size ---
+        # # If you increase mb_size, reduce LR proportionally to keep update magnitude stable.
+        # # Reference: 512 as baseline.
+        # base_lr = float(optimizer.param_groups[0]["lr"])
+        # lr_scale = 512.0 / float(mb_size)
+        # lr_scaled = base_lr * lr_scale
+        # # Optional floor to avoid collapsing to ~0:
+        # lr_floor = 1e-5
+        # lr_scaled = max(lr_floor, lr_scaled)
+        # for g in optimizer.param_groups:
+        #     g["lr"] = lr_scaled
 
         # PPO update
         model.train()
-        upd_stats = ppo_update(
-            model=model,
-            optimizer=optimizer,
-            obs=obs,
-            masks=masks,
-            actions=actions,
-            logp_old=logp_old,
-            returns=returns,
-            adv=adv,
-            clip_eps=0.2,
-            vf_coef=0.5,
-            ent_coef=ent_coef_used,
-            epochs=ppo_epochs_used,
-            minibatch_size=mb_size,
-            value_clip=0.2,
-            use_amp=use_amp,
-            scaler=scaler,
-            target_kl=target_kl_used,
-            temperature=temperature,
-            upd=upd,
-            kl_stop_factor=2.5,
-            stop_on_mb_kl=True,
-        )
-        prev_entropy = float(upd_stats["entropy"])
-        for g in optimizer.param_groups:
-            g["lr"] = base_lr
+        last_good_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        last_good_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+        try:
+            upd_stats = ppo_update(
+                model=model,
+                optimizer=optimizer,
+                obs=obs,
+                masks=masks,
+                actions=actions,
+                logp_old=logp_old,
+                returns=returns,
+                adv=adv,
+                clip_eps=0.15,
+                vf_coef=0.25,
+                ent_coef=ent_coef_used,
+                epochs=ppo_epochs_used,
+                minibatch_size=512,
+                value_clip=0.1,
+                use_amp=use_amp,
+                scaler=scaler,
+                target_kl=target_kl_used,
+                temperature=temperature,
+                upd=upd,
+                kl_stop_factor=1.5,
+                stop_on_mb_kl=True,
+            )
+            prev_entropy = float(upd_stats["entropy"])
+        except RuntimeError as e:
+            print(f"[PPO] update failed at upd={upd}: {e} -> rollback + lr*=0.5")
+            model.load_state_dict(last_good_state, strict=True)
+            for g, lr0 in zip(optimizer.param_groups, last_good_lrs):
+                g["lr"] = max(1e-5, lr0 * 0.5)
+            continue
+        # for g in optimizer.param_groups:
+        #     g["lr"] = base_lr
 
         # Update EMA early-stop and adapt LR if we are constantly on the KL limiter
         early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
