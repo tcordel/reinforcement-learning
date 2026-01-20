@@ -619,9 +619,21 @@ for _k in range(8):
     for _a in range(81):
         _ACTION_PERM_NP[_k, _a] = _transform_action(_a, _k)
 
+# invperm[k, a_new] = a_old  (useful for transforming action masks via gather)
+_ACTION_INVPERM_NP = np.zeros((8, 81), dtype=np.int64)
+for _k in range(8):
+    for _a_old in range(81):
+        _a_new = _ACTION_PERM_NP[_k, _a_old]
+        _ACTION_INVPERM_NP[_k, _a_new] = _a_old
+
 def _perm_on_device(device: torch.device) -> torch.Tensor:
     # (8,81) int64 on device
     return torch.from_numpy(_ACTION_PERM_NP).to(device=device, dtype=torch.long)
+
+def _invperm_on_device(device: torch.device) -> torch.Tensor:
+    # (8,81) int64 on device
+    return torch.from_numpy(_ACTION_INVPERM_NP).to(device=device, dtype=torch.long)
+
 
 def _transform_board_batch(x: torch.Tensor, k: int) -> torch.Tensor:
     # x: (..., 9, 9) -> same shape, transformed on last two dims
@@ -698,6 +710,39 @@ def _augment_symmetries(
         torch.cat(adv_out, dim=0),
     )
 
+def _augment_symmetries_random(
+    obs: torch.Tensor,
+    masks: torch.Tensor,
+    actions: torch.Tensor,
+    logp_old: torch.Tensor,
+    returns: torch.Tensor,
+    adv: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Apply ONE random D4 symmetry per sample (batch size unchanged).
+    This avoids multiplying the PPO minibatches by 8 (which often causes "always clipping").
+    """
+    device = obs.device
+    perm = _perm_on_device(device)         # (8,81) old->new
+    invp = _invperm_on_device(device)      # (8,81) new->old
+    N = obs.shape[0]
+
+    ks = torch.randint(0, 8, (N,), device=device)  # (N,)
+    ar = torch.arange(N, device=device)
+
+    # obs: build all 8 transforms then select per-sample
+    obs8 = torch.stack([_transform_board_batch(obs, k) for k in range(8)], dim=0)  # (8,N,C,9,9)
+    obs_t = obs8[ks, ar]  # (N,C,9,9)
+
+    # actions: a_new = perm[k, a_old]
+    act_t = perm[ks, actions]
+
+    # masks: m_new[new] = m_old[old] => m_new = gather(m_old, invperm)
+    inv_idx = invp[ks]                 # (N,81) new->old
+    masks_t = masks.gather(1, inv_idx) # bool -> bool
+
+    # logp_old becomes invalid after transform; keep placeholder (recomputed after call in train)
+    return obs_t, masks_t, act_t, logp_old, returns, adv
 
 Phase = Literal["A", "B", "C"]
 
@@ -1152,6 +1197,7 @@ def ppo_update(
         v_old = v_old.detach()
 
     idxs = torch.arange(N, device=obs.device)
+
     for _epoch in range(epochs):
         epoch_kl_sum = 0.0
         epoch_kl_n = 0
@@ -1170,7 +1216,8 @@ def ppo_update(
                 new_logp = dist.log_prob(actions[mb])
                 entropy = dist.entropy().mean()
 
-                ratio = torch.exp(new_logp - logp_old[mb])
+                log_ratio = new_logp - logp_old[mb]
+                ratio = torch.exp(log_ratio)
                 surr1 = ratio * adv[mb]
                 surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv[mb]
                 pi_loss = -torch.min(surr1, surr2).mean()
@@ -1210,7 +1257,8 @@ def ppo_update(
                         raise RuntimeError("Non-finite parameters after optimizer step")
 
             with torch.no_grad():
-                approx_kl = (logp_old[mb] - new_logp).mean()
+                # Robust approx KL (SB3 style): (ratio - 1) - log_ratio  (non-negative in expectation)
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
                 clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
                 akl = float(approx_kl.item())
                 max_kl = max(max_kl, akl)
@@ -1255,6 +1303,7 @@ def ppo_update(
         "ret_mean": float(returns.mean().item()),
         "ret_std": float(returns.std(unbiased=False).item()),
         "early_stop": 1.0 if early_stop else 0.0,
+        "minibatch": n_updates / epochs,
     }
 
 
@@ -1482,16 +1531,18 @@ def train(
         else:
             micro_reward_used = cur.micro_win_reward
 
-        # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
-        # Slightly stronger rescue when entropy is really low (your run drops <0.3)
-        if prev_entropy is None:
-            ent_coef_used = cur.ent_coef
-        elif prev_entropy < 0.5:
-            ent_coef_used = max(cur.ent_coef, 0.03)
-        elif prev_entropy < 0.8:
-            ent_coef_used = max(cur.ent_coef, 0.02)
-        else:
-            ent_coef_used = cur.ent_coef
+        # # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
+        # # Slightly stronger rescue when entropy is really low (your run drops <0.3)
+        # if prev_entropy is None:
+        #     ent_coef_used = cur.ent_coef
+        # elif prev_entropy < 0.5:
+        #     ent_coef_used = max(cur.ent_coef, 0.03)
+        # elif prev_entropy < 0.8:
+        #     ent_coef_used = max(cur.ent_coef, 0.02)
+        # else:
+        #     ent_coef_used = cur.ent_coef
+        # Keep entropy coefficient fixed per curriculum phase (avoid closed-loop oscillations)
+        ent_coef_used = cur.ent_coef
  
 
         # ---- Apply live overrides (if any) ----
@@ -1541,9 +1592,15 @@ def train(
             lam=lam,
         )
 
-        # --- D4 symmetry augmentation (x8) ---
+        # # --- D4 symmetry augmentation (x8) ---
+        # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
+        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+        #     obs, masks, actions, logp_old, returns, adv
+        # )
+        # --- D4 symmetry augmentation (random, batch size unchanged) ---
         # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+        # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
+        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
             obs, masks, actions, logp_old, returns, adv
         )
         # IMPORTANT (PPO correctness):
@@ -1565,7 +1622,7 @@ def train(
         # target_minibatches = 8
         # mb_size = (N + target_minibatches - 1) // target_minibatches
         # mb_size = max(512, mb_size) if N >= 512 else N
-        # mb_size = min(mb_size, 1024)  # hard cap (important for stability)
+        # # mb_size = min(mb_size, 1024)  # hard cap (important for stability)
         # mb_size = min(mb_size, N)
         #
         # # --- LR scaling with minibatch size ---
@@ -1608,15 +1665,16 @@ def train(
                 kl_stop_factor=1.5,
                 stop_on_mb_kl=True,
             )
-            prev_entropy = float(upd_stats["entropy"])
+            # prev_entropy = float(upd_stats["entropy"])
+
+            # for g in optimizer.param_groups:
+            #     g["lr"] = base_lr
         except RuntimeError as e:
             print(f"[PPO] update failed at upd={upd}: {e} -> rollback + lr*=0.5")
             model.load_state_dict(last_good_state, strict=True)
             for g, lr0 in zip(optimizer.param_groups, last_good_lrs):
                 g["lr"] = max(1e-5, lr0 * 0.5)
             continue
-        # for g in optimizer.param_groups:
-        #     g["lr"] = base_lr
 
         # Update EMA early-stop and adapt LR if we are constantly on the KL limiter
         early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
@@ -1635,6 +1693,7 @@ def train(
         writer.add_scalar("rollout/opp_delta_elo_mean", roll_stats.get("opp_elo_mean", 0.0) - elo.get("current"), upd)
         writer.add_scalar("rollout/opp_stronger_frac", roll_stats.get("opp_stronger_frac", 0.0), upd)
         writer.add_scalar("rollout/episodes", roll_stats["episodes"], upd)
+        writer.add_scalar("train/minibatch", upd_stats["minibatch"], upd)
         writer.add_scalar("train/pi_loss", upd_stats["pi_loss"], upd)
         writer.add_scalar("train/v_loss", upd_stats["v_loss"], upd)
         writer.add_scalar("train/entropy", upd_stats["entropy"], upd)
