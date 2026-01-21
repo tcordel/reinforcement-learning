@@ -773,7 +773,7 @@ class Curriculum:
         # phase C
         return CurriculumParams(
             p_vs_random=0.35,   # anti-forgetting vs random
-            micro_win_reward=0.0,
+            micro_win_reward=0.02,
             ent_coef=0.01,
             temp_floor=0.6,
         )
@@ -1507,16 +1507,17 @@ def train(
         # - Phase A: keep shaping constant to reliably beat random
         # - Phase B: anneal shaping from phase entry over micro_reward_anneal_updates
         # - Phase C: shaping already 0
-        if curriculum.phase == "A":
-            micro_reward_used = cur.micro_win_reward
-        elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
-            phase_age = max(0, upd - phase_start_upd)
-            frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
-            frac = float(np.clip(frac, 0.0, 1.0))
-            micro_reward_used = cur.micro_win_reward * frac
-        else:
-            micro_reward_used = cur.micro_win_reward
+        # if curriculum.phase == "A":
+        #     micro_reward_used = cur.micro_win_reward
+        # elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
+        #     phase_age = max(0, upd - phase_start_upd)
+        #     frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
+        #     frac = float(np.clip(frac, 0.0, 1.0))
+        #     micro_reward_used = cur.micro_win_reward * frac
+        # else:
+        #     micro_reward_used = cur.micro_win_reward
 
+        micro_reward_used = cur.micro_win_reward
         # # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
         # # Slightly stronger rescue when entropy is really low (your run drops <0.3)
         # if prev_entropy is None:
@@ -1638,11 +1639,11 @@ def train(
                 returns=returns,
                 adv=adv,
                 clip_eps=0.10,
-                vf_coef=0.25,
+                vf_coef=0.5,
                 ent_coef=ent_coef_used,
                 epochs=ppo_epochs_used,
                 minibatch_size=512,
-                value_clip=0.1,
+                value_clip=0.2,
                 use_amp=use_amp,
                 scaler=scaler,
                 target_kl=target_kl_used,
