@@ -429,26 +429,12 @@ class UTTTEnv:
         if _check_macro_win(self.micro_status, self.current_player):
             self.done = True
             self.winner = self.current_player
+        elif np.all(self.micro_status != 0):
+            self.done = True
+            self.winner = 0
         else:
             self.done = False
-            # If the game is blocked (no legal moves) or fully resolved (all microboards finished),
-            # apply your tie-break rule: winner is the player with more microboards won.
-            # IMPORTANT: this must NOT depend on current_player.
-            no_moves = (not self._legal_mask().any())
-            all_done = bool(np.all(self.micro_status != 0))
-            if no_moves or all_done:
-                x_wins = int(np.sum(self.micro_status == 1))
-                o_wins = int(np.sum(self.micro_status == -1))
-                if x_wins > o_wins:
-                    self.winner = 1
-                elif o_wins > x_wins:
-                    self.winner = -1
-                else:
-                    self.winner = 0
-                self.done = True
-            else:
-                self.done = False
-                self.winner = None
+            self.winner = None
 
         # next_board is determined by local cell inside the microboard we played
         # BUT if that target microboard is already finished, next player can play anywhere.
