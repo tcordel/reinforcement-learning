@@ -1465,6 +1465,9 @@ def train(
     best = Opponent(name="snap_000000", model=snap0)
     opponent_pool.append(best)
 
+    gold_850 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
+    gold_850.load_state_dict(torch.load("./uttt-final-lame-ending.pth"))
+
     elo = Elo(k=16.0)
     elo.ratings["current"] = 1000.0
     elo.ratings[best.name] = elo.get("current")
@@ -1722,11 +1725,13 @@ def train(
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             last_snap = opponent_pool[-1]
             eval_vs_snap = play_match(model, last_snap.model, device, n_games=80, temperature=0.1, deterministic=True)
-
             eval_vs_best = play_match(model, best.model, device, n_games=80, temperature=0.1, deterministic=True)
+            eval_vs_gold = play_match(model, gold_850, device, n_games=80, temperature=0.1, deterministic=True)
+
             writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
             writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
             writer.add_scalar("eval/vs_champion_loss", eval_vs_best["loss_rate"], upd)
+            writer.add_scalar("eval/vs_gold", eval_vs_gold["win_rate"] - eval_vs_gold["loss_rate"], upd)
 
             # Evaluate vs random with a small helper model that samples uniformly from legal moves
             # We'll just do explicit random opponent here:
