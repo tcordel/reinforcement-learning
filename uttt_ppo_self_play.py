@@ -1495,14 +1495,14 @@ def train(
             ppo_epochs_used = 1
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
-            target_kl_used = 0.04
+            target_kl_used = 0.08
             p_latest = 0.70
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
             ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
         else:
-            target_kl_used = 0.04
+            target_kl_used = 0.08
             p_latest = 0.80
             ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
 
@@ -1510,29 +1510,29 @@ def train(
         # - Phase A: keep shaping constant to reliably beat random
         # - Phase B: anneal shaping from phase entry over micro_reward_anneal_updates
         # - Phase C: shaping already 0
-        # if curriculum.phase == "A":
-        #     micro_reward_used = cur.micro_win_reward
-        # elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
-        #     phase_age = max(0, upd - phase_start_upd)
-        #     frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
-        #     frac = float(np.clip(frac, 0.0, 1.0))
-        #     micro_reward_used = cur.micro_win_reward * frac
+        if curriculum.phase == "A":
+            micro_reward_used = cur.micro_win_reward
+        elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
+            phase_age = max(0, upd - phase_start_upd)
+            frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
+            frac = float(np.clip(frac, 0.0, 1.0))
+            micro_reward_used = cur.micro_win_reward * frac
         # else:
         #     micro_reward_used = cur.micro_win_reward
 
         micro_reward_used = cur.micro_win_reward
-        # # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
-        # # Slightly stronger rescue when entropy is really low (your run drops <0.3)
-        # if prev_entropy is None:
-        #     ent_coef_used = cur.ent_coef
-        # elif prev_entropy < 0.5:
-        #     ent_coef_used = max(cur.ent_coef, 0.03)
-        # elif prev_entropy < 0.8:
-        #     ent_coef_used = max(cur.ent_coef, 0.02)
-        # else:
-        #     ent_coef_used = cur.ent_coef
+        # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
+        # Slightly stronger rescue when entropy is really low (your run drops <0.3)
+        if prev_entropy is None:
+            ent_coef_used = cur.ent_coef
+        elif prev_entropy < 0.5:
+            ent_coef_used = max(cur.ent_coef, 0.03)
+        elif prev_entropy < 0.8:
+            ent_coef_used = max(cur.ent_coef, 0.02)
+        else:
+            ent_coef_used = cur.ent_coef
         # Keep entropy coefficient fixed per curriculum phase (avoid closed-loop oscillations)
-        ent_coef_used = cur.ent_coef
+        # ent_coef_used = cur.ent_coef
  
 
         # ---- Apply live overrides (if any) ----
@@ -1584,15 +1584,15 @@ def train(
 
         # --- D4 symmetry augmentation (x8) ---
         # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
-            obs, masks, actions, logp_old, returns, adv
-        )
+        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+        #     obs, masks, actions, logp_old, returns, adv
+        # )
         # # --- D4 symmetry augmentation (random, batch size unchanged) ---
         # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
         # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
-        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
-        #     obs, masks, actions, logp_old, returns, adv
-        # )
+        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+            obs, masks, actions, logp_old, returns, adv
+        )
         # IMPORTANT (PPO correctness):
         # After symmetry augmentation, (obs, action) changed, so the stored logp_old
         # from the original rollout is no longer valid. Recompute it with the current
@@ -1653,9 +1653,9 @@ def train(
                 temperature=temperature,
                 upd=upd,
                 kl_stop_factor=1.5,
-                stop_on_mb_kl=True,
+                stop_on_mb_kl=False,
             )
-            # prev_entropy = float(upd_stats["entropy"])
+            prev_entropy = float(upd_stats["entropy"])
 
             # for g in optimizer.param_groups:
             #     g["lr"] = base_lr
@@ -1885,7 +1885,7 @@ if __name__ == "__main__":
             seed=1,
             device_str="cpu",
             total_updates=100000,
-            rollout_steps=1024,
+            rollout_steps=2048,
             n_envs=8,
             lr=1e-4,
             gamma=0.99,
