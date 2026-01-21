@@ -1592,17 +1592,17 @@ def train(
             lam=lam,
         )
 
-        # # --- D4 symmetry augmentation (x8) ---
-        # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
-        #     obs, masks, actions, logp_old, returns, adv
-        # )
-        # --- D4 symmetry augmentation (random, batch size unchanged) ---
+        # --- D4 symmetry augmentation (x8) ---
         # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
-        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+        obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
             obs, masks, actions, logp_old, returns, adv
         )
+        # # --- D4 symmetry augmentation (random, batch size unchanged) ---
+        # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
+        # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
+        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+        #     obs, masks, actions, logp_old, returns, adv
+        # )
         # IMPORTANT (PPO correctness):
         # After symmetry augmentation, (obs, action) changed, so the stored logp_old
         # from the original rollout is no longer valid. Recompute it with the current
@@ -1847,7 +1847,15 @@ def train(
             opponent_pool.append(snap_op)
             elo.ratings[snap_op.name] = elo.get("current")
             if len(opponent_pool) > max_pool:
-                opponent_pool.pop(0)
+                # remove worst opponent
+                elo_evitec = np.inf
+                index=-1
+                for i in range(len(opponent_pool)):
+                    evict = opponent_pool[i]
+                    if elo.ratings[evict.name] < elo_evitec:
+                        index = i
+                        elo_evitec = elo.ratings[evict.name]
+                opponent_pool.pop(index)
 
     writer.close()
     torch.save(model.state_dict(), "./uttt-final.pth")
@@ -1885,15 +1893,15 @@ if __name__ == "__main__":
             seed=1,
             device_str="cpu",
             total_updates=100000,
-            rollout_steps=2048,
+            rollout_steps=1024,
             n_envs=8,
-            lr=5e-5,
+            lr=1e-4,
             gamma=0.99,
             lam=0.95,
             temperature_start=1.3,
             temperature_end=0.8,
             snapshot_interval=50,
-            max_pool=20,
+            max_pool=50,
             p_vs_random=0.2,
             eval_interval=100,
             model_channels=32,
