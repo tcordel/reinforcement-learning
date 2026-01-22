@@ -1564,7 +1564,7 @@ def train(
         ent_coef_used = _ov("ent_coef", ent_coef_used)
         temperature = _ov("temperature", temperature)
         rollout_steps_used = int(_ov("rollout_steps", rollout_steps_used))
-        minibatch_size_used = int(_ov("minibatch_size", minibatch_size_used))
+        minibatch_size_override = int(_ov("minibatch_size", minibatch_size_used))
         
 
         # Collect rollouts
@@ -1596,15 +1596,18 @@ def train(
 
         # --- D4 symmetry augmentation (x8) ---
         # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
-        #     obs, masks, actions, logp_old, returns, adv
-        # )
-        # # --- D4 symmetry augmentation (random, batch size unchanged) ---
-        # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
-        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
-            obs, masks, actions, logp_old, returns, adv
-        )
+        if curriculum.phase == 'A':
+            obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+                obs, masks, actions, logp_old, returns, adv
+            )
+            minibatch_size_override = min(512 * 8, int(obs.shape[0]))
+        else:
+            # # --- D4 symmetry augmentation (random, batch size unchanged) ---
+            # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
+            # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
+            obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+                obs, masks, actions, logp_old, returns, adv
+            )
         # IMPORTANT (PPO correctness):
         # After symmetry augmentation, (obs, action) changed, so the stored logp_old
         # from the original rollout is no longer valid. Recompute it with the current
@@ -1657,7 +1660,7 @@ def train(
                 vf_coef=0.5,
                 ent_coef=ent_coef_used,
                 epochs=ppo_epochs_used,
-                minibatch_size=minibatch_size_used,
+                minibatch_size=minibatch_size_override,
                 value_clip=0.2,
                 use_amp=use_amp,
                 scaler=scaler,
