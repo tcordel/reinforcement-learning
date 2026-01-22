@@ -772,9 +772,9 @@ class Curriculum:
             )
         # phase C
         return CurriculumParams(
-            p_vs_random=0.35,   # anti-forgetting vs random
-            micro_win_reward=0.02,
-            ent_coef=0.01,
+            p_vs_random=0.25,   # anti-forgetting vs random
+            micro_win_reward=0.0,
+            ent_coef=0.02,
             temp_floor=0.6,
         )
 
@@ -1473,7 +1473,7 @@ def train(
     elo.ratings[best.name] = elo.get("current")
 
     champion_margin = 0.10
-    champion_needed_streak = 3
+    champion_needed_streak = 2
     champion_streak = 0
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
@@ -1495,14 +1495,14 @@ def train(
             ppo_epochs_used = 1
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
-            target_kl_used = 0.08
+            target_kl_used = 0.04
             p_latest = 0.70
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
             ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
         else:
-            target_kl_used = 0.08
+            target_kl_used = 0.04
             p_latest = 0.80
             ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
 
@@ -1724,13 +1724,17 @@ def train(
             # here we evaluate via play_match(current vs best_snapshot) + custom random matches separately.
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             last_snap = opponent_pool[-1]
-            eval_vs_snap = play_match(model, last_snap.model, device, n_games=80, temperature=0.1, deterministic=True)
-            eval_vs_best = play_match(model, best.model, device, n_games=80, temperature=0.1, deterministic=True)
-            eval_vs_gold = play_match(model, gold_850, device, n_games=80, temperature=0.1, deterministic=True)
+            eval_vs_snap = play_match(model, last_snap.model, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_best = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_best_determ = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=True)
+            eval_vs_gold = play_match(model, gold_850, device, n_games=50, temperature=temperature, deterministic=False)
 
             writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
             writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
             writer.add_scalar("eval/vs_champion_loss", eval_vs_best["loss_rate"], upd)
+            writer.add_scalar("eval/vs_champion_win_deter", eval_vs_best_determ["win_rate"], upd)
+            writer.add_scalar("eval/vs_champion_draw_deter", eval_vs_best_determ["draw_rate"], upd)
+            writer.add_scalar("eval/vs_champion_loss_deter", eval_vs_best_determ["loss_rate"], upd)
             writer.add_scalar("eval/vs_gold", eval_vs_gold["win_rate"] - eval_vs_gold["loss_rate"], upd)
 
             # Evaluate vs random with a small helper model that samples uniformly from legal moves
@@ -1761,27 +1765,29 @@ def train(
             writer.add_scalar("eval/vs_snapshot_draw", eval_vs_snap["draw_rate"], upd)
             writer.add_scalar("eval/vs_snapshot_loss", eval_vs_snap["loss_rate"], upd)
 
+            vs_random_win_rate_sanity = 1 if eval_vs_random["win_rate"] > 0.8 else 0
             writer.add_scalar("eval/vs_random_win", eval_vs_random["win_rate"], upd)
             writer.add_scalar("eval/vs_random_draw", eval_vs_random["draw_rate"], upd)
             writer.add_scalar("eval/vs_random_loss", eval_vs_random["loss_rate"], upd)
+            writer.add_scalar("eval/vs_random_win_rate_sanity", vs_random_win_rate_sanity, upd)
             # Curriculum phase update (piloté par métriques)
             prev_phase = curriculum.phase
             new_phase = curriculum.update(
                 win_vs_random=eval_vs_random["win_rate"],
                 win_vs_snapshot_last=eval_vs_snap["win_rate"],
             )
-            if new_phase != prev_phase:
-                print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
-                # One-off optimizer changes at phase transitions:
-                # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
-                # Reducing LR makes policy updates smoother and improves snapshot progress.
-                if new_phase == "B":
-                    _set_lr(0.5)   # halve LR once
-                elif new_phase == "C":
-                    _set_lr(0.8)   # slight reduction
-                last_phase = new_phase
-                # Reset phase clock so anneals start *at phase entry*
-                phase_start_upd = upd
+            # if new_phase != prev_phase:
+            #     print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
+            #     # One-off optimizer changes at phase transitions:
+            #     # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
+            #     # Reducing LR makes policy updates smoother and improves snapshot progress.
+            #     if new_phase == "B":
+            #         _set_lr(0.5)   # halve LR once
+            #     elif new_phase == "C":
+            #         _set_lr(0.8)   # slight reduction
+            #     last_phase = new_phase
+            #     # Reset phase clock so anneals start *at phase entry*
+            #     phase_start_upd = upd
 
 
             def update_elo(eval, opp_name):
@@ -1813,7 +1819,7 @@ def train(
 
             # Promote to champion only after several consecutive positive evaluations
             champion_margin_obs = float(eval_vs_best["win_rate"] - eval_vs_best["loss_rate"])
-            if champion_margin_obs >= champion_margin:
+            if champion_margin_obs >= champion_margin and eval_vs_best_determ:
                 champion_streak += 1
             else:
                 champion_streak = 0
