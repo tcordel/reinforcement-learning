@@ -61,7 +61,10 @@ LIVE_HP = {
     "elo_tau": None,                 # float > 0
     "strong_bias": None,             # float >= 0
     "strong_scale": None,            # float > 0
+    "delta_elo": None,
 
+    "rollout_steps": None,           # int > 0
+    "minibatch_size": None,          # int > 0
     "target_kl": None,               # float > 0
     "ent_coef": None,                # float >= 0
     "temperature": None,             # float > 0 (override schedule)
@@ -105,6 +108,9 @@ const fields = [
   ["elo_tau", "float > 0"],
   ["strong_bias", "float >= 0"],
   ["strong_scale", "float > 0"],
+  ["delta_elo", "float > 0"],
+  ["rollout_steps", "int > 0"],
+  ["minibatch_size", "int > 0"],
   ["target_kl", "float > 0"],
   ["ent_coef", "float >= 0"],
   ["temperature", "float > 0 (override schedule)"],
@@ -736,7 +742,6 @@ Phase = Literal["A", "B", "C"]
 class CurriculumParams:
     p_vs_random: float
     micro_win_reward: float
-    ent_coef: float
     temp_floor: float
 
 class Curriculum:
@@ -759,7 +764,6 @@ class Curriculum:
             return CurriculumParams(
                 p_vs_random=1.0,
                 micro_win_reward=0.1,
-                ent_coef=0.02,
                 temp_floor=0.9,
             )
         if self.phase == "B":
@@ -767,14 +771,12 @@ class Curriculum:
                 p_vs_random=0.5,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
-                ent_coef=0.02,
                 temp_floor=0.9,
             )
         # phase C
         return CurriculumParams(
             p_vs_random=0.25,   # anti-forgetting vs random
             micro_win_reward=0.0,
-            ent_coef=0.02,
             temp_floor=0.6,
         )
 
@@ -1406,6 +1408,7 @@ def train(
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
     total_updates: int = 5000,
     rollout_steps: int = 4096,
+    minibatch_size: int = 512,
     n_envs: int = 16,
     lr: float = 2e-4,
     gamma: float = 0.99,
@@ -1419,6 +1422,7 @@ def train(
     model_channels: int = 64,
     model_blocks: int = 8,
     micro_reward_anneal_updates: int = 2000,
+    delta_elo: float = 120,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1441,8 +1445,10 @@ def train(
      # --- Adaptive control to avoid "always early-stop" late in phase B
     early_stop_ema = 0.0
     early_stop_ema_beta = 0.98  # slow EMA
-    min_lr = max(lr * 0.05, 1e-5)  # don't go too low on CPU
+    min_lr = max(lr * 0.05, 1e-6)  # don't go too low on CPU
 
+    rollout_steps_used = rollout_steps
+    minibatch_size_used = minibatch_size
     # track phase transitions to apply one-off optimizer changes
     last_phase = curriculum.phase
 
@@ -1475,8 +1481,11 @@ def train(
     champion_margin = 0.10
     champion_needed_streak = 2
     champion_streak = 0
+    champion_promotion_episode = None
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
+
+    ent_coef_used = 0.01
 
     for upd in range(1, total_updates + 1):
 
@@ -1523,14 +1532,13 @@ def train(
         micro_reward_used = cur.micro_win_reward
         # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
         # Slightly stronger rescue when entropy is really low (your run drops <0.3)
-        if prev_entropy is None:
-            ent_coef_used = cur.ent_coef
-        elif prev_entropy < 0.5:
-            ent_coef_used = max(cur.ent_coef, 0.03)
-        elif prev_entropy < 0.8:
-            ent_coef_used = max(cur.ent_coef, 0.02)
-        else:
-            ent_coef_used = cur.ent_coef
+
+        if prev_entropy is not None:
+            if prev_entropy < 0.4:
+                ent_coef_used *= 1.1
+            if prev_entropy > 0.55:
+                ent_coef_used *= 0.95
+        ent_coef_used = np.clip(ent_coef_used, 0.005, 0.04)
         # Keep entropy coefficient fixed per curriculum phase (avoid closed-loop oscillations)
         # ent_coef_used = cur.ent_coef
  
@@ -1542,6 +1550,7 @@ def train(
         def _ov(name, default):
             v = hp.get(name, None)
             return default if (v is None) else float(v)
+
         
         # overrides (only if user set them)
         p_vs_random_used = _ov("p_vs_random", cur.p_vs_random)
@@ -1549,10 +1558,13 @@ def train(
         elo_tau_used = _ov("elo_tau", 200.0)
         strong_bias_used = _ov("strong_bias", 0.30)
         strong_scale_used = _ov("strong_scale", 200.0)
+        delta_elo = _ov("delta_elo", delta_elo)
         
         target_kl_used = _ov("target_kl", target_kl_used)
         ent_coef_used = _ov("ent_coef", ent_coef_used)
         temperature = _ov("temperature", temperature)
+        rollout_steps_used = int(_ov("rollout_steps", rollout_steps_used))
+        minibatch_size_used = int(_ov("minibatch_size", minibatch_size_used))
         
 
         # Collect rollouts
@@ -1562,7 +1574,7 @@ def train(
             opponent_pool=opponent_pool,
             elo=elo,
             device=device,
-            rollout_steps=rollout_steps,
+            rollout_steps=rollout_steps_used,
             n_envs=n_envs,
             temperature=temperature,
             micro_win_reward=micro_reward_used,
@@ -1645,7 +1657,7 @@ def train(
                 vf_coef=0.5,
                 ent_coef=ent_coef_used,
                 epochs=ppo_epochs_used,
-                minibatch_size=512,
+                minibatch_size=minibatch_size_used,
                 value_clip=0.2,
                 use_amp=use_amp,
                 scaler=scaler,
@@ -1670,8 +1682,8 @@ def train(
         early_stop_ema = early_stop_ema_beta * early_stop_ema + (1.0 - early_stop_ema_beta) * float(upd_stats["early_stop"])
         # Avoid collapsing LR to the floor: prefer fixing KL/batch rather than decaying every update.
         # Only apply a mild decay if we are *extremely* often on the KL limiter for a long time.
-        if curriculum.phase != "A" and early_stop_ema > 0.90 and (upd % 200 == 0):
-            _set_lr(0.95)
+        # if curriculum.phase != "A" and early_stop_ema > 0.90 and (upd % 200 == 0):
+        #     _set_lr(0.95)
 
         if upd > 0 and upd % eval_interval == 0:
             torch.save(model.state_dict(), f"./uttt-{upd}.pth")
@@ -1776,6 +1788,7 @@ def train(
                 win_vs_random=eval_vs_random["win_rate"],
                 win_vs_snapshot_last=eval_vs_snap["win_rate"],
             )
+
             # if new_phase != prev_phase:
             #     print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
             #     # One-off optimizer changes at phase transitions:
@@ -1827,15 +1840,32 @@ def train(
             writer.add_scalar("eval/champion_margin", champion_margin_obs, upd)
             writer.add_scalar("eval/champion_streak", float(champion_streak), upd)
 
+            reset_model = False
             if champion_streak >= champion_needed_streak:
                 best_model = copy.deepcopy(model).to(device)
                 best_model.eval()
                 best = Opponent(name=f"snap_{upd:05d}", model=best_model)
                 elo.ratings[best.name] = elo.get("current")
                 champion_streak = 0
+                champion_promotion_episode = upd
                 writer.add_scalar("eval/champion_promoted", 1.0, upd)
             else:
                 writer.add_scalar("eval/champion_promoted", 0.0, upd)
+                if champion_promotion_episode is not None \
+                    and (upd + 500) > champion_promotion_episode \
+                    and elo.ratings[best.name] > (elo.get("current") + delta_elo):
+                    reset_model = True
+                    champion_promotion_episode = upd
+                    ent_coef_used *= 1.2
+                    _set_lr(0.5)
+                    rollout_steps_used = max(rollout_steps_used*2, 8192)
+                    minibatch_size_used = rollout_steps_used / 4
+
+                    model.load_state_dict(best.model.state_dict())
+                    elo.ratings["current"] = elo.get(best.name)
+                    writer.add_scalar("eval/reset_champion", 1, upd)
+            if not reset_model:
+                writer.add_scalar("eval/reset_champion", 0, upd)
 
         # Snapshot update (AFTER eval so evalS compares to an older snapshot)
         if upd % snapshot_interval == 0:
