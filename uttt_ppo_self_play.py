@@ -68,7 +68,13 @@ LIVE_HP = {
     "target_kl": None,               # float > 0
     "ent_coef": None,                # float >= 0
     "temperature": None,             # float > 0 (override schedule)
+    "lr": None,                      # float > 0
+    "min_lr": None,                  # float > 0
 }
+
+def reset_live_hp():
+    with LIVE_HP_LOCK:
+        LIVE_HP["lr"] = None
 
 LIVE_HP_HTML = """<!doctype html>
 <html>
@@ -1482,10 +1488,12 @@ def train(
     champion_needed_streak = 2
     champion_streak = 0
     champion_promotion_episode = None
+    reset_model_counter = 0
+    reset_model_upd = None
 
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
-    ent_coef_used = 0.01
+    ent_coef= 0.01
     temperature_range = 5000
 
     for upd in range(1, total_updates + 1):
@@ -1528,15 +1536,18 @@ def train(
         # else:
         #     micro_reward_used = cur.micro_win_reward
 
-        micro_reward_used = cur.micro_win_reward
         # Entropy-adaptive ent_coef (if policy collapses, push exploration back up)
         # Slightly stronger rescue when entropy is really low (your run drops <0.3)
 
         if prev_entropy is not None:
             if prev_entropy < 0.4:
-                ent_coef_used *= 1.1
+                ent_coef *= 1.1
             if prev_entropy > 0.55:
-                ent_coef_used *= 0.95
+                ent_coef *= 0.95
+
+        ent_coef_used = ent_coef
+        if reset_model_upd is not None and (upd - reset_model_upd) < 200:
+            ent_coef_used *= 1.2
         ent_coef_used = np.clip(ent_coef_used, 0.005, 0.04)
         # Keep entropy coefficient fixed per curriculum phase (avoid closed-loop oscillations)
         # ent_coef_used = cur.ent_coef
@@ -1564,7 +1575,12 @@ def train(
         temperature = _ov("temperature", temperature)
         rollout_steps_used = int(_ov("rollout_steps", rollout_steps_used))
         minibatch_size_override = int(_ov("minibatch_size", minibatch_size_used))
+        min_lr = _ov("min_lr", min_lr)
+        lr = _ov("lr", 0)
+        if lr > 0:
+            _set_lr(lr)
         
+        reset_live_hp()
 
         # Collect rollouts
         model.eval()
@@ -1715,7 +1731,7 @@ def train(
         writer.add_scalar("train/ret_std", upd_stats["ret_std"], upd)
         writer.add_scalar("train/temperature", temperature, upd)
         writer.add_scalar("train/target_kl", target_kl_used, upd)
-        writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[cur.phase if hasattr(cur, "phase") else curriculum.phase], upd)
+        writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[curriculum.phase], upd)
         writer.add_scalar("curriculum/p_vs_random", p_vs_random_used, upd)
         writer.add_scalar("curriculum/p_latest", p_latest_used, upd)
         writer.add_scalar("curriculum/micro_win_reward_base", cur.micro_win_reward, upd)
@@ -1851,15 +1867,22 @@ def train(
                 champion_streak = 0
                 champion_promotion_episode = upd
                 writer.add_scalar("eval/champion_promoted", 1.0, upd)
+                reset_model_counter = 0
             else:
                 writer.add_scalar("eval/champion_promoted", 0.0, upd)
                 if champion_promotion_episode is not None \
-                    and (upd + 500) > champion_promotion_episode \
+                    and (upd + 250) > champion_promotion_episode \
                     and elo.ratings[best.name] > (elo.get("current") + delta_elo):
+                    reset_model_counter += 1
                     reset_model = True
+                    reset_model_upd = upd
+                    if reset_model_counter % 2 == 0:
+                        _set_lr(0.5)
+
+                    # reset chaches
+                    prev_entropy = None
+                    champion_streak = 0
                     champion_promotion_episode = upd
-                    ent_coef_used *= 1.2
-                    _set_lr(0.5)
                     # rollout_steps_used = max(rollout_steps_used*2, 8192)
                     # minibatch_size_used = rollout_steps_used / 4
 
@@ -1929,7 +1952,7 @@ if __name__ == "__main__":
             gamma=0.99,
             lam=0.95,
             temperature_start=1.3,
-            temperature_end=0.8,
+            temperature_end=0.15,
             snapshot_interval=50,
             max_pool=500,
             p_vs_random=0.2,
