@@ -771,13 +771,13 @@ class Curriculum:
                 p_vs_random=0.5,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
-                temp_floor=0.9,
+                temp_floor=0.7,
             )
         # phase C
         return CurriculumParams(
             p_vs_random=0.25,   # anti-forgetting vs random
             micro_win_reward=0.0,
-            temp_floor=0.6,
+            temp_floor=0.3,
         )
 
     def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
@@ -1445,7 +1445,7 @@ def train(
      # --- Adaptive control to avoid "always early-stop" late in phase B
     early_stop_ema = 0.0
     early_stop_ema_beta = 0.98  # slow EMA
-    min_lr = max(lr * 0.05, 1e-6)  # don't go too low on CPU
+    min_lr = max(lr * 0.05, 5e-6)  # don't go too low on CPU
 
     rollout_steps_used = rollout_steps
     minibatch_size_used = minibatch_size
@@ -1486,22 +1486,23 @@ def train(
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
     ent_coef_used = 0.01
+    temperature_range = 5000
 
     for upd in range(1, total_updates + 1):
 
         # temperature schedule
-        t = (upd - 1) / max(total_updates - 1, 1)
+        t = (phase_start_upd - 1) / max(temperature_range - 1, 1)
         temperature = temperature_start + t * (temperature_end - temperature_start)
 
         # curriculum params
         cur = curriculum.params()
         temperature = max(temperature, cur.temp_floor)
 
+        ppo_epochs_used = 4 if early_stop_ema < 0.15 else 2 if early_stop_ema < 0.35 else 1
         # Phase-dependent PPO target_kl and opponent hardness
         if curriculum.phase == "A":
             target_kl_used = 0.03
             p_latest = 0.50
-            ppo_epochs_used = 1
         elif curriculum.phase == "B":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
             target_kl_used = 0.04
@@ -1509,11 +1510,9 @@ def train(
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
-            ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
         else:
             target_kl_used = 0.04
             p_latest = 0.80
-            ppo_epochs_used = 2 if early_stop_ema < 0.35 else 1
 
         # Shaping schedule:
         # - Phase A: keep shaping constant to reliably beat random
@@ -1792,7 +1791,7 @@ def train(
                 win_vs_snapshot_last=eval_vs_snap["win_rate"],
             )
 
-            # if new_phase != prev_phase:
+            if new_phase != prev_phase:
             #     print(f"[curriculum] phase {prev_phase} -> {new_phase} at upd={upd}")
             #     # One-off optimizer changes at phase transitions:
             #     # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
@@ -1803,7 +1802,7 @@ def train(
             #         _set_lr(0.8)   # slight reduction
             #     last_phase = new_phase
             #     # Reset phase clock so anneals start *at phase entry*
-            #     phase_start_upd = upd
+                phase_start_upd = upd
 
 
             def update_elo(eval, opp_name):
@@ -1861,8 +1860,8 @@ def train(
                     champion_promotion_episode = upd
                     ent_coef_used *= 1.2
                     _set_lr(0.5)
-                    rollout_steps_used = max(rollout_steps_used*2, 8192)
-                    minibatch_size_used = rollout_steps_used / 4
+                    # rollout_steps_used = max(rollout_steps_used*2, 8192)
+                    # minibatch_size_used = rollout_steps_used / 4
 
                     model.load_state_dict(best.model.state_dict())
                     elo.ratings["current"] = elo.get(best.name)
@@ -1932,7 +1931,7 @@ if __name__ == "__main__":
             temperature_start=1.3,
             temperature_end=0.8,
             snapshot_interval=50,
-            max_pool=50,
+            max_pool=500,
             p_vs_random=0.2,
             eval_interval=100,
             model_channels=32,
