@@ -1479,6 +1479,12 @@ def train(
 
     gold_850 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     gold_850.load_state_dict(torch.load("./uttt-final-lame-ending.pth"))
+    gold_850.eval()
+    opponent_pool.append(Opponent(name="gold_850", model=snap0))
+    gold_1100 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
+    gold_1100.load_state_dict(torch.load("./uttt-gold-1100.pth"))
+    gold_1100.eval()
+    opponent_pool.append(Opponent(name="gold_1100", model=snap0))
 
     elo = Elo(k=16.0)
     elo.ratings["current"] = 1000.0
@@ -1499,7 +1505,7 @@ def train(
     for upd in range(1, total_updates + 1):
 
         # temperature schedule
-        t = (phase_start_upd - 1) / max(temperature_range - 1, 1)
+        t = (upd - phase_start_upd) / max(temperature_range - 1, 1)
         temperature = temperature_start + t * (temperature_end - temperature_start)
 
         # curriculum params
@@ -1917,7 +1923,7 @@ def train(
 
 if __name__ == "__main__":
     port = 8080
-    server = start_live_hp_server(host="0.0.0.0", port=port)
+    # server = start_live_hp_server(host="0.0.0.0", port=port)
     print(f"Live HP server on http://0.0.0.0:{port}")
     # Preset auto CPU/GPU:
     if torch.cuda.is_available():
