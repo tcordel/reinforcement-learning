@@ -782,7 +782,7 @@ class Curriculum:
         if self.phase == "B":
             return CurriculumParams(
                 p_vs_random=0.5,
-                p_vs_gold=0.2,
+                p_vs_gold=1,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
                 temp_floor=0.7,
@@ -792,7 +792,7 @@ class Curriculum:
             p_vs_random=0.15,   # anti-forgetting vs random
             p_vs_gold=0.45,
             micro_win_reward=0.0,
-            temp_floor=0.3,
+            temp_floor=0.4,
         )
 
     def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
@@ -972,7 +972,8 @@ def collect_rollouts(
                     env.opponent_model = None
                     env.opponent_name = "random"
                 elif (rng.random() < p_vs_gold):
-                    opp = opponent_gold
+                    env.opponent_model = opponent_gold.model
+                    env.opponent_name = opponent_gold.name
                 else:
                     opp = sample_opponent_by_elo(
                         opponent_pool=opponent_pool,
@@ -1519,7 +1520,7 @@ def train(
     phase_start_upd = 1  # start update index of the current phase (for shaping anneal)
 
     ent_coef= 0.01
-    temperature_range = 5000
+    temperature_range = 15000
 
     for upd in range(1, total_updates + 1):
 
@@ -1797,7 +1798,7 @@ def train(
             eval_vs_snap_determ = play_match(model, last_snap.model, device, n_games=80, temperature=temperature, deterministic=True)
             eval_vs_best = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=False)
             eval_vs_best_determ = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=True)
-            eval_vs_gold = play_match(model, gold_850, device, n_games=50, temperature=temperature, deterministic=False)
+            eval_vs_gold = play_match(model, gold_850, device, n_games=200, temperature=temperature, deterministic=False)
 
             writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
             writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
@@ -1844,7 +1845,7 @@ def train(
             prev_phase = curriculum.phase
             new_phase = curriculum.update(
                 win_vs_random=eval_vs_random["win_rate"],
-                win_vs_snapshot_last=eval_vs_snap_determ["win_rate"],
+                win_vs_snapshot_last=eval_vs_gold["win_rate"] ,
             )
 
             if new_phase != prev_phase:
