@@ -71,11 +71,13 @@ LIVE_HP = {
     "temperature": None,             # float > 0 (override schedule)
     "lr": None,                      # float > 0
     "min_lr": None,                  # float > 0
+    "reset": None,                   # int > 0
 }
 
 def reset_live_hp():
     with LIVE_HP_LOCK:
         LIVE_HP["lr"] = None
+        LIVE_HP["reset"] = None
 
 LIVE_HP_HTML = """<!doctype html>
 <html>
@@ -122,6 +124,7 @@ const fields = [
   ["target_kl", "float > 0"],
   ["ent_coef", "float >= 0"],
   ["temperature", "float > 0 (override schedule)"],
+  ["reset", "int > 0 (reset model)"],
 ];
 
 function mkForm(cfg) {
@@ -1420,6 +1423,11 @@ class Elo:
 # 5) TRAIN LOOP
 # ============================================================
 
+def reset_model_from_file(model: nn.Module, file):
+    if os.path.exists(file):
+        model.load_state_dict(torch.load(file, map_location="cpu"))
+
+
 def train(
     seed: int = 1,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -1456,8 +1464,7 @@ def train(
 
     model = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    if os.path.exists("./uttt-load.pth"):
-        model.load_state_dict(torch.load("./uttt-load.pth", map_location="cpu"))
+    reset_model_from_file(model, "./uttt-load.pth")
 
      # --- Adaptive control to avoid "always early-stop" late in phase B
     early_stop_ema = 0.0
@@ -1595,9 +1602,20 @@ def train(
         rollout_steps_used = int(_ov("rollout_steps", rollout_steps_used))
         minibatch_size_override = int(_ov("minibatch_size", minibatch_size_used))
         min_lr = _ov("min_lr", min_lr)
+        reset = _ov("reset", 0)
         lr = _ov("lr", 0)
         if lr > 0:
             _set_lr(lr)
+        if reset > 0:
+            reset_model_from_file(model=model, file=f"./uttt-{reset}.pth")
+            prev_entropy = None
+            champion_streak = 0
+            champion_promotion_episode = upd
+            writer.add_scalar("eval/reset_champion", 1, upd)
+            reset_model_counter = 0
+            reset_model = True
+            reset_model_upd = upd
+            champion_needed_streak = 0
         
         reset_live_hp()
 
