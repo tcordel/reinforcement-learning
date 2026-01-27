@@ -57,6 +57,7 @@ LIVE_HP_LOCK = threading.Lock()
 LIVE_HP = {
     # None = "no override"
     "p_vs_random": None,             # float [0..1]
+    "p_vs_gold": None,             # float [0..1]
     "p_use_latest_snapshot": None,   # float [0..1]
     "elo_tau": None,                 # float > 0
     "strong_bias": None,             # float >= 0
@@ -110,6 +111,7 @@ LIVE_HP_HTML = """<!doctype html>
 <script>
 const fields = [
   ["p_vs_random", "float 0..1"],
+  ["p_vs_gold", "float 0..1"],
   ["p_use_latest_snapshot", "float 0..1"],
   ["elo_tau", "float > 0"],
   ["strong_bias", "float >= 0"],
@@ -747,6 +749,7 @@ Phase = Literal["A", "B", "C"]
 @dataclass
 class CurriculumParams:
     p_vs_random: float
+    p_vs_gold: float
     micro_win_reward: float
     temp_floor: float
 
@@ -769,19 +772,22 @@ class Curriculum:
         if self.phase == "A":
             return CurriculumParams(
                 p_vs_random=1.0,
+                p_vs_gold=0,
                 micro_win_reward=0.1,
                 temp_floor=0.9,
             )
         if self.phase == "B":
             return CurriculumParams(
                 p_vs_random=0.5,
+                p_vs_gold=0.2,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
                 temp_floor=0.7,
             )
         # phase C
         return CurriculumParams(
-            p_vs_random=0.25,   # anti-forgetting vs random
+            p_vs_random=0.15,   # anti-forgetting vs random
+            p_vs_gold=0.45,
             micro_win_reward=0.0,
             temp_floor=0.3,
         )
@@ -789,7 +795,7 @@ class Curriculum:
     def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
         if self.phase == "A":
             self._stableA = self._stableA + 1 if win_vs_random >= 0.65 else 0
-            if self._stableA >= 3:
+            if self._stableA >= 4:
                 self.phase = "B"
                 self._stableA = 0
         elif self.phase == "B":
@@ -909,6 +915,7 @@ def sample_opponent_by_elo(
 def collect_rollouts(
     model: nn.Module,
     opponent_pool: List[Opponent],
+    opponent_gold: Opponent,
     elo: "Elo",
     device: torch.device,
     rollout_steps: int = 4096,
@@ -916,6 +923,7 @@ def collect_rollouts(
     temperature: float = 1.0,
     micro_win_reward: float = 0.0,
     p_vs_random: float = 0.2,
+    p_vs_gold: float = 0.2,
     p_use_latest_snapshot: float = 0.5,
     elo_tau: float = 200.0,
     strong_bias: float = 0.30,
@@ -960,6 +968,8 @@ def collect_rollouts(
                 if env.opponent_is_random:
                     env.opponent_model = None
                     env.opponent_name = "random"
+                elif (rng.random() < p_vs_gold):
+                    opp = opponent_gold
                 else:
                     opp = sample_opponent_by_elo(
                         opponent_pool=opponent_pool,
@@ -1211,6 +1221,7 @@ def ppo_update(
                 entropy = dist.entropy().mean()
 
                 log_ratio = new_logp - logp_old[mb]
+                log_ratio = torch.clamp(log_ratio, -20, 20)
                 ratio = torch.exp(log_ratio)
                 surr1 = ratio * adv[mb]
                 surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv[mb]
@@ -1480,7 +1491,8 @@ def train(
     gold_850 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     gold_850.load_state_dict(torch.load("./uttt-final-lame-ending.pth"))
     gold_850.eval()
-    opponent_pool.append(Opponent(name="gold_850", model=snap0))
+    opponent_gold = Opponent(name="gold_850", model=snap0)
+    opponent_pool.append(opponent_gold)
     gold_1100 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     gold_1100.load_state_dict(torch.load("./uttt-gold-1100.pth"))
     gold_1100.eval()
@@ -1532,13 +1544,13 @@ def train(
         # - Phase A: keep shaping constant to reliably beat random
         # - Phase B: anneal shaping from phase entry over micro_reward_anneal_updates
         # - Phase C: shaping already 0
-        if curriculum.phase == "A":
-            micro_reward_used = cur.micro_win_reward
-        elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
-            phase_age = max(0, upd - phase_start_upd)
-            frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
-            frac = float(np.clip(frac, 0.0, 1.0))
-            micro_reward_used = cur.micro_win_reward * frac
+        # if curriculum.phase == "A":
+        #     micro_reward_used = cur.micro_win_reward
+        # elif cur.micro_win_reward > 0.0 and micro_reward_anneal_updates > 0:
+        phase_age = max(0, upd - 0)
+        frac = 1.0 - phase_age / float(micro_reward_anneal_updates)
+        frac = float(np.clip(frac, 0.0, 1.0))
+        micro_reward_used = 0.1 * frac
         # else:
         #     micro_reward_used = cur.micro_win_reward
 
@@ -1570,6 +1582,7 @@ def train(
         
         # overrides (only if user set them)
         p_vs_random_used = _ov("p_vs_random", cur.p_vs_random)
+        p_vs_gold_used = _ov("p_vs_gold", cur.p_vs_gold)
         p_latest_used = _ov("p_use_latest_snapshot", p_latest)
         elo_tau_used = _ov("elo_tau", 200.0)
         strong_bias_used = _ov("strong_bias", 0.30)
@@ -1593,6 +1606,7 @@ def train(
         transitions, roll_stats = collect_rollouts(
             model=model,
             opponent_pool=opponent_pool,
+            opponent_gold=opponent_gold,
             elo=elo,
             device=device,
             rollout_steps=rollout_steps_used,
@@ -1600,6 +1614,7 @@ def train(
             temperature=temperature,
             micro_win_reward=micro_reward_used,
             p_vs_random=p_vs_random_used,
+            p_vs_gold=p_vs_gold_used,
             p_use_latest_snapshot=p_latest_used,
             elo_tau=elo_tau_used,
             strong_bias=strong_bias_used,
@@ -1617,18 +1632,18 @@ def train(
 
         # --- D4 symmetry augmentation (x8) ---
         # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
-        if curriculum.phase == 'A':
-            obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
-                obs, masks, actions, logp_old, returns, adv
-            )
-            minibatch_size_override = min(512 * 8, int(obs.shape[0]))
-        else:
+        # if curriculum.phase == 'A':
+        #     obs, masks, actions, logp_old, returns, adv = _augment_symmetries(
+        #         obs, masks, actions, logp_old, returns, adv
+        #     )
+        #     minibatch_size_override = min(512 * 8, int(obs.shape[0]))
+        # else:
             # # --- D4 symmetry augmentation (random, batch size unchanged) ---
             # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
             # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
-            obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
-                obs, masks, actions, logp_old, returns, adv
-            )
+        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+            obs, masks, actions, logp_old, returns, adv
+        )
         # IMPORTANT (PPO correctness):
         # After symmetry augmentation, (obs, action) changed, so the stored logp_old
         # from the original rollout is no longer valid. Recompute it with the current
@@ -1761,6 +1776,7 @@ def train(
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             last_snap = opponent_pool[-1]
             eval_vs_snap = play_match(model, last_snap.model, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_snap_determ = play_match(model, last_snap.model, device, n_games=80, temperature=temperature, deterministic=True)
             eval_vs_best = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=False)
             eval_vs_best_determ = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=True)
             eval_vs_gold = play_match(model, gold_850, device, n_games=50, temperature=temperature, deterministic=False)
@@ -1810,7 +1826,7 @@ def train(
             prev_phase = curriculum.phase
             new_phase = curriculum.update(
                 win_vs_random=eval_vs_random["win_rate"],
-                win_vs_snapshot_last=eval_vs_snap["win_rate"],
+                win_vs_snapshot_last=eval_vs_snap_determ["win_rate"],
             )
 
             if new_phase != prev_phase:
@@ -1825,6 +1841,7 @@ def train(
             #     last_phase = new_phase
             #     # Reset phase clock so anneals start *at phase entry*
                 phase_start_upd = upd
+                temperature_start = temperature
 
 
             def update_elo(eval, opp_name):
@@ -1882,6 +1899,7 @@ def train(
                     reset_model_counter += 1
                     reset_model = True
                     reset_model_upd = upd
+                    champion_needed_streak = 0
                     if reset_model_counter % 2 == 0:
                         _set_lr(0.5)
 
@@ -1923,7 +1941,7 @@ def train(
 
 if __name__ == "__main__":
     port = 8080
-    # server = start_live_hp_server(host="0.0.0.0", port=port)
+    server = start_live_hp_server(host="0.0.0.0", port=port)
     print(f"Live HP server on http://0.0.0.0:{port}")
     # Preset auto CPU/GPU:
     if torch.cuda.is_available():
