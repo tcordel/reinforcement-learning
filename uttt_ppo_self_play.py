@@ -747,7 +747,7 @@ def _augment_symmetries_random(
     # logp_old becomes invalid after transform; keep placeholder (recomputed after call in train)
     return obs_t, masks_t, act_t, logp_old, returns, adv
 
-Phase = Literal["A", "B", "C"]
+Phase = Literal["A", "B", "C", "D"]
 
 @dataclass
 class CurriculumParams:
@@ -760,8 +760,9 @@ class Curriculum:
     """
     3 phases pilotées par métriques:
       - A: vs random + shaping léger
-      - B: mix random/snap + shaping réduit
-      - C: quasi pur self-play, shaping 0
+      - B: mix random/gold_1100 + shaping réduit
+      - C: mix random/gold_850 + shaping réduit
+      - D: quasi pur self-play, shaping 0
     Transition:
       A->B si win_rate_vs_random > 0.65 pendant 3 evals
       B->C si win_rate_vs_snapshot_last > 0.55 pendant 3 evals
@@ -782,7 +783,15 @@ class Curriculum:
         if self.phase == "B":
             return CurriculumParams(
                 p_vs_random=0.5,
-                p_vs_gold=1,
+                p_vs_gold=0.8,
+                micro_win_reward=0.02,
+                # Phase B: keep exploration a bit higher; your entropy collapses otherwise
+                temp_floor=0.7,
+            )
+        if self.phase == "C":
+            return CurriculumParams(
+                p_vs_random=0.5,
+                p_vs_gold=0.8,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
                 temp_floor=0.7,
@@ -790,21 +799,21 @@ class Curriculum:
         # phase C
         return CurriculumParams(
             p_vs_random=0.15,   # anti-forgetting vs random
-            p_vs_gold=0.45,
+            p_vs_gold=0.35,
             micro_win_reward=0.0,
             temp_floor=0.4,
         )
 
-    def update(self, win_vs_random: float, win_vs_snapshot_last: float) -> Phase:
+    def update(self, win_vs_random: float, win_vs_snapshot_last: float, win_vs_snapshot_deter: float) -> Phase:
         if self.phase == "A":
             self._stableA = self._stableA + 1 if win_vs_random >= 0.65 else 0
             if self._stableA >= 4:
                 self.phase = "B"
                 self._stableA = 0
-        elif self.phase == "B":
-            self._stableB = self._stableB + 1 if win_vs_snapshot_last > 0.55 else 0
-            if self._stableB >= 3:
-                self.phase = "C"
+        elif self.phase == "B" or self.phase == "C":
+            self._stableB = self._stableB + 1 if win_vs_snapshot_last > 0.55 and win_vs_snapshot_deter > 0.75 else 0
+            if self._stableB >= 2:
+                self.phase = "C" if self.phase == "B" else "D"
                 self._stableB = 0
         return self.phase
 
@@ -1042,7 +1051,7 @@ def collect_rollouts(
                     a_op = act_random(o_mid["action_mask"], rng)
                 else:
                     x_op, m_op = obs_to_torch(o_mid, device)
-                    a_op, _, _ = act(env.opponent_model, x_op, m_op, temperature=1.0)
+                    a_op, _, _ = act(env.opponent_model, x_op, m_op, temperature=temperature)
                 o_mid, _, _, _ = env.step(a_op)
                 env_state[i] = o_mid
 
@@ -1499,12 +1508,13 @@ def train(
     gold_850 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     gold_850.load_state_dict(torch.load("./uttt-final-lame-ending.pth"))
     gold_850.eval()
-    opponent_gold = Opponent(name="gold_850", model=snap0)
-    opponent_pool.append(opponent_gold)
+    opponent_gold_850 = Opponent(name="gold_850", model=gold_850)
+    opponent_pool.append(opponent_gold_850)
     gold_1100 = UTTTPVNet(in_channels=7, channels=model_channels, n_blocks=model_blocks).to(device)
     gold_1100.load_state_dict(torch.load("./uttt-gold-1100.pth"))
     gold_1100.eval()
-    opponent_pool.append(Opponent(name="gold_1100", model=snap0))
+    opponent_gold_1100 = Opponent(name="gold_1100", model=gold_1100)
+    opponent_pool.append(opponent_gold_1100)
 
     elo = Elo(k=16.0)
     elo.ratings["current"] = 1000.0
@@ -1537,7 +1547,7 @@ def train(
         if curriculum.phase == "A":
             target_kl_used = 0.03
             p_latest = 0.50
-        elif curriculum.phase == "B":
+        elif curriculum.phase == "B" or curriculum.phase == "C":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
             target_kl_used = 0.04
             p_latest = 0.70
@@ -1625,7 +1635,7 @@ def train(
         transitions, roll_stats = collect_rollouts(
             model=model,
             opponent_pool=opponent_pool,
-            opponent_gold=opponent_gold,
+            opponent_gold=opponent_gold_850 if curriculum.phase == "C" else opponent_gold_1100,
             elo=elo,
             device=device,
             rollout_steps=rollout_steps_used,
@@ -1771,7 +1781,7 @@ def train(
         writer.add_scalar("train/ret_std", upd_stats["ret_std"], upd)
         writer.add_scalar("train/temperature", temperature, upd)
         writer.add_scalar("train/target_kl", target_kl_used, upd)
-        writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2}[curriculum.phase], upd)
+        writer.add_scalar("curriculum/phase_id", {"A": 0, "B": 1, "C": 2, "D": 3}[curriculum.phase], upd)
         writer.add_scalar("curriculum/p_vs_random", p_vs_random_used, upd)
         writer.add_scalar("curriculum/p_latest", p_latest_used, upd)
         writer.add_scalar("curriculum/micro_win_reward_base", cur.micro_win_reward, upd)
@@ -1795,18 +1805,20 @@ def train(
             # Evaluate vs best snapshot (last one in pool is usually strongest recent)
             last_snap = opponent_pool[-1]
             eval_vs_snap = play_match(model, last_snap.model, device, n_games=200, temperature=temperature, deterministic=False)
-            eval_vs_snap_determ = play_match(model, last_snap.model, device, n_games=80, temperature=temperature, deterministic=True)
+            eval_vs_snap_determ = play_match(model, last_snap.model, device, n_games=2, temperature=temperature, deterministic=True)
             eval_vs_best = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=False)
             eval_vs_best_determ = play_match(model, best.model, device, n_games=200, temperature=temperature, deterministic=True)
-            eval_vs_gold = play_match(model, gold_850, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_gold_850 = play_match(model, gold_850, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_gold_850_deter = play_match(model, gold_850, device, n_games=2, temperature=temperature, deterministic=True)
+            eval_vs_gold_1100= play_match(model, gold_1100, device, n_games=200, temperature=temperature, deterministic=False)
+            eval_vs_gold_1100_deter = play_match(model, gold_1100, device, n_games=2, temperature=temperature, deterministic=True)
 
-            writer.add_scalar("eval/vs_champion_win", eval_vs_best["win_rate"], upd)
-            writer.add_scalar("eval/vs_champion_draw", eval_vs_best["draw_rate"], upd)
-            writer.add_scalar("eval/vs_champion_loss", eval_vs_best["loss_rate"], upd)
-            writer.add_scalar("eval/vs_champion_win_deter", eval_vs_best_determ["win_rate"], upd)
-            writer.add_scalar("eval/vs_champion_draw_deter", eval_vs_best_determ["draw_rate"], upd)
-            writer.add_scalar("eval/vs_champion_loss_deter", eval_vs_best_determ["loss_rate"], upd)
-            writer.add_scalar("eval/vs_gold", eval_vs_gold["win_rate"] - eval_vs_gold["loss_rate"], upd)
+            writer.add_scalar("eval/vs_champion", eval_vs_best["win_rate"] - eval_vs_best["loss_rate"], upd)
+            writer.add_scalar("eval/vs_champion_deter", eval_vs_best_determ["win_rate"] - eval_vs_best_determ["loss_rate"], upd)
+            writer.add_scalar("eval/vs_gold_850", eval_vs_gold_850["win_rate"] - eval_vs_gold_850["loss_rate"], upd)
+            writer.add_scalar("eval/vs_gold_850_deter", eval_vs_gold_850_deter["win_rate"] - eval_vs_gold_850_deter["loss_rate"], upd)
+            writer.add_scalar("eval/vs_gold_1100", eval_vs_gold_1100["win_rate"] - eval_vs_gold_1100["loss_rate"], upd)
+            writer.add_scalar("eval/vs_gold_1100_deter", eval_vs_gold_1100_deter["win_rate"] - eval_vs_gold_1100_deter["loss_rate"], upd)
 
             # Evaluate vs random with a small helper model that samples uniformly from legal moves
             # We'll just do explicit random opponent here:
@@ -1832,20 +1844,18 @@ def train(
                 else: draws += 1
             eval_vs_random = {"win_rate": wins/n_eval, "draw_rate": draws/n_eval, "loss_rate": losses/n_eval}
 
-            writer.add_scalar("eval/vs_snapshot_win", eval_vs_snap["win_rate"], upd)
-            writer.add_scalar("eval/vs_snapshot_draw", eval_vs_snap["draw_rate"], upd)
-            writer.add_scalar("eval/vs_snapshot_loss", eval_vs_snap["loss_rate"], upd)
+            writer.add_scalar("eval/vs_snapshot", eval_vs_snap["win_rate"] - eval_vs_snap["loss_rate"], upd)
 
             vs_random_win_rate_sanity = 1 if eval_vs_random["win_rate"] > 0.8 else 0
-            writer.add_scalar("eval/vs_random_win", eval_vs_random["win_rate"], upd)
-            writer.add_scalar("eval/vs_random_draw", eval_vs_random["draw_rate"], upd)
-            writer.add_scalar("eval/vs_random_loss", eval_vs_random["loss_rate"], upd)
+            writer.add_scalar("eval/vs_random", eval_vs_random["win_rate"] - eval_vs_random["loss_rate"], upd)
             writer.add_scalar("eval/vs_random_win_rate_sanity", vs_random_win_rate_sanity, upd)
             # Curriculum phase update (piloté par métriques)
             prev_phase = curriculum.phase
             new_phase = curriculum.update(
                 win_vs_random=eval_vs_random["win_rate"],
-                win_vs_snapshot_last=eval_vs_gold["win_rate"] ,
+                win_vs_snapshot_last=eval_vs_gold_850["win_rate"] if curriculum.phase == "C" else eval_vs_gold_1100["win_rate"],
+                win_vs_snapshot_deter=eval_vs_gold_850_deter["win_rate"] if curriculum.phase == "C" else eval_vs_gold_1100_deter["win_rate"],
+
             )
 
             if new_phase != prev_phase:
@@ -1892,7 +1902,7 @@ def train(
 
             # Promote to champion only after several consecutive positive evaluations
             champion_margin_obs = float(eval_vs_best["win_rate"] - eval_vs_best["loss_rate"])
-            if champion_margin_obs >= champion_margin and eval_vs_best_determ:
+            if champion_margin_obs >= champion_margin and eval_vs_best_determ["win_rate"] > 0.75:
                 champion_streak += 1
             else:
                 champion_streak = 0
