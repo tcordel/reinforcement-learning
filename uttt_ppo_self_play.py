@@ -784,24 +784,24 @@ class Curriculum:
             )
         if self.phase == "B":
             return CurriculumParams(
-                p_vs_random=0.5,
-                p_vs_gold=0.8,
+                p_vs_random=0.0,
+                p_vs_gold=0.25,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
                 temp_floor=0.7,
             )
         if self.phase == "C":
             return CurriculumParams(
-                p_vs_random=0.5,
-                p_vs_gold=0.8,
+                p_vs_random=0.0,
+                p_vs_gold=0.25,
                 micro_win_reward=0.02,
                 # Phase B: keep exploration a bit higher; your entropy collapses otherwise
                 temp_floor=0.7,
             )
         # phase C
         return CurriculumParams(
-            p_vs_random=0.15,   # anti-forgetting vs random
-            p_vs_gold=0.35,
+            p_vs_random=0.0,   # anti-forgetting vs random
+            p_vs_gold=0.25,
             micro_win_reward=0.0,
             temp_floor=0.4,
         )
@@ -1552,18 +1552,17 @@ def train(
         ppo_epochs_used = 4 if early_stop_ema < 0.15 else 2 if early_stop_ema < 0.35 else 1
         # Phase-dependent PPO target_kl and opponent hardness
         if curriculum.phase == "A":
-            target_kl_used = 0.03
             p_latest = 0.50
         elif curriculum.phase == "B" or curriculum.phase == "C":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
-            target_kl_used = 0.04
-            p_latest = 0.70
+            target_kl_used = 0.06
+            p_latest = 0.90
             # Key change: reduce PPO epochs when we start hitting KL early-stop often.
             # This prevents the "early_stop ~= 1.0" regime you observe after ~3400.
             # (We keep 3 epochs by default, and go down to 2 when EMA early-stop is high.)
         else:
             target_kl_used = 0.04
-            p_latest = 0.80
+            p_latest = 0.90
 
         # Shaping schedule:
         # - Phase A: keep shaping constant to reliably beat random
@@ -1677,19 +1676,19 @@ def train(
             # # --- D4 symmetry augmentation (random, batch size unchanged) ---
             # # Keeps rollouts/GAE coherent by augmenting only AFTER advantage computation.
             # # Avoids x8 batch expansion which makes PPO do 8x more optimizer steps and often leads to permanent clipping.
-        obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
-            obs, masks, actions, logp_old, returns, adv
-        )
+        # obs, masks, actions, logp_old, returns, adv = _augment_symmetries_random(
+        #     obs, masks, actions, logp_old, returns, adv
+        # )
         # IMPORTANT (PPO correctness):
         # After symmetry augmentation, (obs, action) changed, so the stored logp_old
         # from the original rollout is no longer valid. Recompute it with the current
         # model (pre-update) on the augmented batch.
-        with torch.no_grad():
-            logits, _ = model(obs)
-            logits = logits / max(temperature, 1e-6)
-            logits = masked_logits(logits, masks)
-            dist = Categorical(logits=logits)
-            logp_old = dist.log_prob(actions)
+        # with torch.no_grad():
+        #     logits, _ = model(obs)
+        #     logits = logits / max(temperature, 1e-6)
+        #     logits = masked_logits(logits, masks)
+        #     dist = Categorical(logits=logits)
+        #     logp_old = dist.log_prob(actions)
 
         # mb_size = min(512 * 8, int(obs.shape[0]))
         #
@@ -1870,8 +1869,12 @@ def train(
             #     # One-off optimizer changes at phase transitions:
             #     # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
             #     # Reducing LR makes policy updates smoother and improves snapshot progress.
+                rollout_steps = 4096
+                minibatch_size = 1024
                 if new_phase == "B":
-                    _mult_lr(0.5)   # halve LR once
+                    _set_lr(1.5e-4)   # halve LR once
+                else:
+                    _set_lr(5e-5)   # halve LR once
             #     elif new_phase == "C":
             #         _mult_lr(0.8)   # slight reduction
             #     last_phase = new_phase
@@ -2008,16 +2011,16 @@ if __name__ == "__main__":
             total_updates=100000,
             rollout_steps=2048,
             n_envs=8,
-            lr=1e-4,
+            lr=3e-4,
             gamma=0.99,
             lam=0.95,
             temperature_start=1.3,
             temperature_end=0.15,
             snapshot_interval=50,
-            max_pool=500,
+            max_pool=20,
             p_vs_random=0.2,
             eval_interval=100,
-            model_channels=32,
-            model_blocks=4,
+            model_channels=64,
+            model_blocks=6,
         )
 
