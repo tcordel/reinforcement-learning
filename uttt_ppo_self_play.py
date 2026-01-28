@@ -124,6 +124,8 @@ const fields = [
   ["target_kl", "float > 0"],
   ["ent_coef", "float >= 0"],
   ["temperature", "float > 0 (override schedule)"],
+  ["lr", "float > 0"],
+  ["min_lr", "float > 0"],
   ["reset", "int > 0 (reset model)"],
 ];
 
@@ -1486,7 +1488,12 @@ def train(
     # track phase transitions to apply one-off optimizer changes
     last_phase = curriculum.phase
 
-    def _set_lr(mult: float):
+    def _set_lr(lr: float):
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+            if g["lr"] < min_lr:
+                g["lr"] = min_lr
+    def _mult_lr(mult: float):
         for g in optimizer.param_groups:
             g["lr"] = float(g["lr"]) * float(mult)
             if g["lr"] < min_lr:
@@ -1863,10 +1870,10 @@ def train(
             #     # One-off optimizer changes at phase transitions:
             #     # At your phase-B entry, KL spikes + early_stop becomes ~1.0 in your CSV.
             #     # Reducing LR makes policy updates smoother and improves snapshot progress.
-            #     if new_phase == "B":
-            #         _set_lr(0.5)   # halve LR once
+                if new_phase == "B":
+                    _mult_lr(0.5)   # halve LR once
             #     elif new_phase == "C":
-            #         _set_lr(0.8)   # slight reduction
+            #         _mult_lr(0.8)   # slight reduction
             #     last_phase = new_phase
             #     # Reset phase clock so anneals start *at phase entry*
                 phase_start_upd = upd
@@ -1930,7 +1937,7 @@ def train(
                     reset_model_upd = upd
                     champion_needed_streak = 0
                     if reset_model_counter % 2 == 0:
-                        _set_lr(0.5)
+                        _mult_lr(0.5)
 
                     # reset chaches
                     prev_entropy = None
