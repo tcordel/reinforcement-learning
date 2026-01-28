@@ -1552,6 +1552,7 @@ def train(
         ppo_epochs_used = 4 if early_stop_ema < 0.15 else 2 if early_stop_ema < 0.35 else 1
         # Phase-dependent PPO target_kl and opponent hardness
         if curriculum.phase == "A":
+            target_kl_used = 0.04
             p_latest = 0.50
         elif curriculum.phase == "B" or curriculum.phase == "C":
             # Your CSVs show max_kl ~0.04 in phase B -> allow a bit more KL without tripping constantly
@@ -2009,9 +2010,10 @@ if __name__ == "__main__":
             seed=1,
             device_str="cpu",
             total_updates=100000,
-            rollout_steps=2048,
+            rollout_steps=4096,
+            minibatch_size=1024,
             n_envs=8,
-            lr=3e-4,
+            lr=2e-4,
             gamma=0.99,
             lam=0.95,
             temperature_start=1.3,
@@ -2020,7 +2022,7 @@ if __name__ == "__main__":
             max_pool=20,
             p_vs_random=0.2,
             eval_interval=100,
-            model_channels=64,
-            model_blocks=6,
+            model_channels=32,
+            model_blocks=4,
         )
 
