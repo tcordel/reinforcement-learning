@@ -660,6 +660,72 @@ def _transform_board_batch(x: torch.Tensor, k: int) -> torch.Tensor:
         return torch.flip(x.transpose(-2, -1), (-1,))
     raise ValueError(f"bad symmetry k={k}")
 
+def forward_symmetry_ensemble(
+    model: nn.Module,
+    obs: torch.Tensor,         # (B,C,9,9)
+    masks: Optional[torch.Tensor] = None,  # (B,81) bool
+    temperature: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      logits_avg: (B,81)  -- logits = log(probs_avg) in original action indexing
+      v_avg:      (B,)    -- mean value across symmetries
+    """
+    device = obs.device
+    B = obs.shape[0]
+    perm = _perm_on_device(device)        # (8,81): a_new = perm[k,a_old]
+    invperm = _invperm_on_device(device)  # (8,81): a_old = invperm[k,a_new]
+
+    # 1) Build 8x batch (single forward for speed)
+    obs8 = torch.cat([_transform_board_batch(obs, k) for k in range(8)], dim=0)  # (8B,C,9,9)
+    logits8, v8 = model(obs8)  # logits8: (8B,81), v8: (8B,)
+    logits8 = logits8.view(8, B, 81)
+    v8 = v8.view(8, B)
+
+    # Value is invariant -> average
+    v_avg = v8.mean(dim=0)
+
+    # If no mask provided, just unpermute logits then average (rarely used here)
+    if masks is None:
+        logits_un = []
+        for k in range(8):
+            idx = perm[k].view(1, 81).expand(B, 81)          # gather by perm to map to original a_old
+            logits_un.append(logits8[k].gather(1, idx))
+        logits_avg = torch.stack(logits_un, dim=0).mean(dim=0)
+        return logits_avg, v_avg
+
+    masks = masks.bool()
+
+    # 2) Average probabilities in original indexing
+    probs_un = []
+    t = max(float(temperature), 1e-6)
+
+    for k in range(8):
+        # mask in transformed coordinates (a_new):
+        # mask_k[a_new] = mask[a_old] with a_old = invperm[k,a_new]
+        inv = invperm[k].view(1, 81).expand(B, 81)
+        mask_k = masks.gather(1, inv)
+
+        l = logits8[k] / t
+        l = masked_logits(l, mask_k)          # illegal -> -1e9
+        p = torch.softmax(l, dim=-1)          # (B,81) in transformed indexing (a_new)
+
+        # map probs back to original indexing:
+        # p_orig[a_old] = p[a_new = perm[k,a_old]]
+        idx = perm[k].view(1, 81).expand(B, 81)
+        p_orig = p.gather(1, idx)
+        probs_un.append(p_orig)
+
+    probs_avg = torch.stack(probs_un, dim=0).mean(dim=0)     # (B,81)
+
+    # 3) Safety: enforce original legality + renormalize
+    probs_avg = probs_avg * masks.float()
+    probs_avg = probs_avg / probs_avg.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    # 4) Use log(probs) as logits for Categorical (invariant up to a constant)
+    logits_avg = torch.log(probs_avg.clamp_min(1e-20))       # illegal -> ~ -46, fine
+    return logits_avg, v_avg
+
 def _augment_symmetries(
     obs: torch.Tensor,
     masks: torch.Tensor,
@@ -856,8 +922,7 @@ def act_greedy(model: nn.Module, x: torch.Tensor, m: torch.Tensor) -> Tuple[int,
     Returns:
       action, value
     """
-    logits, v = model(x.unsqueeze(0))              # (1,81), (1,)
-    logits = masked_logits(logits, m.unsqueeze(0)) # (1,81)
+    logits, v = forward_symmetry_ensemble(model, x.unsqueeze(0), m.unsqueeze(0))
     a = int(torch.argmax(logits, dim=-1).item())
     return a, float(v.item())
 
@@ -865,9 +930,7 @@ def act_greedy(model: nn.Module, x: torch.Tensor, m: torch.Tensor) -> Tuple[int,
 @torch.no_grad()
 def act(model: nn.Module, x: torch.Tensor, m: torch.Tensor, temperature: float) -> Tuple[int, float, float]:
     # x: (C,9,9) on device; m: (81,)
-    logits, v = model(x.unsqueeze(0))    # (1,81), (1,)
-    logits = logits / max(temperature, 1e-6)
-    logits = masked_logits(logits, m.unsqueeze(0))
+    logits, v = forward_symmetry_ensemble(model, x.unsqueeze(0), m.unsqueeze(0), temperature=temperature)
 
     # Guards: if mask invalid or logits non-finite, fail fast with a clear message
     if not m.any():
@@ -926,6 +989,7 @@ def sample_opponent_by_elo(
     return opponent_pool[idx]
 
 
+@torch.no_grad()
 def collect_rollouts(
     model: nn.Module,
     opponent_pool: List[Opponent],
@@ -1105,6 +1169,7 @@ def collect_rollouts(
     return transitions, stats
 
 
+@torch.no_grad()
 def compute_gae(
     transitions: List[Transition],
     model: nn.Module,
@@ -1129,7 +1194,7 @@ def compute_gae(
     with torch.no_grad():
         next_obs = torch.stack([t.next_obs for t in transitions], dim=0).to(device)
         next_masks = torch.stack([t.next_mask for t in transitions], dim=0).to(device)
-        next_logits, next_values = model(next_obs)
+        _, next_values = forward_symmetry_ensemble(model, next_obs, next_masks, temperature=1.0)
         # note: next_values shape (N,)
         next_values = next_values
 
@@ -1212,7 +1277,7 @@ def ppo_update(
 
     # cache old values for value clipping
     with torch.no_grad():
-        _, v_old = model(obs)
+        _, v_old = forward_symmetry_ensemble(model, obs, masks, temperature=1.0)
         v_old = v_old.detach()
 
     idxs = torch.arange(N, device=obs.device)
@@ -1225,9 +1290,7 @@ def ppo_update(
             mb = perm[start:start + minibatch_size]
 
             with autocast(enabled=use_amp):
-                logits, v = model(obs[mb])
-                logits = logits / max(temperature, 1e-6)
-                logits = masked_logits(logits, masks[mb])
+                logits, v = forward_symmetry_ensemble(model, obs[mb], masks[mb], temperature=temperature)
                 if not torch.isfinite(logits).all():
                     raise RuntimeError("Non-finite logits produced in PPO forward pass")
                 dist = Categorical(logits=logits)
